@@ -1,5 +1,5 @@
 This is the complete MovieClaw downstream patch inventory, imported from
-MovieClaw local commit `e2a19002`, following [the vendored engine layout](https://github.com/movieclaw/MovieClaw/tree/main/apps/apple/Vendor/AetherEngine).
+MovieClaw local commit `e2a19002`, following [the vendored engine layout](https://github.com/movieclaw/MovieClaw/tree/e2a19002/apps/apple/Vendor/AetherEngine).
 The original Chinese rationale is retained for provenance. References to MovieClaw host design files
 can be found in the [MovieClaw documentation](https://github.com/movieclaw/MovieClaw/tree/main/docs/design).
 The English host API contract is in [docs/api.md](docs/api.md).
@@ -110,4 +110,4 @@ The English host API contract is in [docs/api.md](docs/api.md).
 
 （P6 已并入 P5：按主播放列表名选主片是目录读取协议的一个字段。P40 是「MKV 索引预热改跳起播点」的第一版，没有 P42 时对照无收益、撤回过，编号空着；同样的改动在 P42 之后以 P45 重新启用。）
 
-升级上游版本时：先把上游新版原样覆盖 `Sources/AetherEngine`，再逐个重打仍需要的补丁，然后跑语料回归。
+升级上游版本时：在维护分支合并选定的 upstream 提交，逐项核对补丁与测试，再跑 App 三端编译与真实播放回归。MovieClaw 固定依赖经过验证的 fork 提交，不自动跟随 main；流程见 [维护说明](docs/movieclaw-maintenance.md)。

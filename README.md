@@ -24,6 +24,13 @@
 
 ---
 
+## MovieClaw downstream fork
+
+This repository maintains MovieClaw extensions on top of upstream AetherEngine.
+MovieClaw consumes a full commit SHA, with its transitive dependencies locked separately.
+See [the patch inventory](PATCHES.md) and [maintenance workflow](docs/movieclaw-maintenance.md).
+The badges and general documentation below describe upstream; they are not downstream test results.
+
 ## What it is
 
 A player engine that gets the hard parts right (HDR, Dolby Vision, Dolby Atmos, container coverage, codec coverage) and exposes a single `AetherPlayerView` (UIKit / AppKit) or `AetherPlayerSurface` (SwiftUI) plus a handful of `async` methods. No `AVPlayerViewController`. No opinionated controls. No analytics. Bind the view, call `play()`, read the published properties for state.
