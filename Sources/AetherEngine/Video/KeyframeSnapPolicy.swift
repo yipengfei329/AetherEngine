@@ -91,11 +91,11 @@ enum KeyframeSnapPolicy {
 }
 
 extension AetherEngine {
-    /// [MovieClaw P36] 主力通路精确落点允许的逐帧解码预算（秒）；超过就吸附到最近的关键帧。≤ 0 关闭（真机对照用）
-    nonisolated(unsafe) public static var seekSnapDecodeBudgetSeconds: Double = 0.2
-    /// [MovieClaw P39] 起播落点允许的逐帧解码预算（秒）；超过就从前一个关键帧开播。比跳转的预算小：
-    /// 起播时还没有画面，早几秒开播不打断任何东西，而逐帧解的每一毫秒都算在首帧里。≤ 0 关闭（真机对照用）
-    nonisolated(unsafe) public static var startSnapDecodeBudgetSeconds: Double = 0.05
+    /// [MovieClaw P36] 主力通路精确落点允许的逐帧解码预算（秒）；超过就吸附到最近的关键帧。≤ 0（默认）关闭即上游的精确落点；MovieClaw 设 0.2
+    nonisolated(unsafe) public static var seekSnapDecodeBudgetSeconds: Double = 0
+    /// [MovieClaw P39] 起播落点允许的逐帧解码预算（秒）；超过就从前一个关键帧开播（≤ 0 默认关闭；MovieClaw 设 0.05）。比跳转的预算小：
+    /// 起播时还没有画面，早几秒开播不打断任何东西，而逐帧解的每一毫秒都算在首帧里
+    nonisolated(unsafe) public static var startSnapDecodeBudgetSeconds: Double = 0
 
     /// [MovieClaw P28] VOD 起播 / 跳转后等 AVPlayer 开播时，多久看一次缓冲过没过线（秒）。原来 0.1 秒：
     /// 从头播时第一个分片一到缓冲就过线了，平均还要干等半个间隔（真机首帧到开播 110～150 毫秒）。

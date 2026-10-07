@@ -810,22 +810,28 @@ final class SourceByteCache: @unchecked Sendable {
 }
 
 extension AetherEngine {
-    /// [MovieClaw P33] 点播换封装的分片目标时长（秒，默认 2，上游 4）。AVPlayer 要等一整段产出、送达才开画，
+    /// [MovieClaw P33] 点播换封装的分片目标时长（秒，默认 4 同上游，MovieClaw 设 2）。AVPlayer 要等一整段产出、送达才开画，
     /// 分片越短，起播与缓冲外跳转要先产出、先攒的数据越少。宿主可在装载前改，并按比例放大前后窗口的段数
     /// （窗口按段计，缓冲的时长不变）。夹在 1～6 秒；长 GOP 的片子分片仍按关键帧间隔切，不会短于它
-    nonisolated(unsafe) public static var vodSegmentTargetSeconds: Double = 2.0 {
+    nonisolated(unsafe) public static var vodSegmentTargetSeconds: Double = 4.0 {
         didSet { vodSegmentTargetSeconds = Swift.min(6, Swift.max(1, vodSegmentTargetSeconds)) }
     }
 
-    /// [MovieClaw P34] 探测流时把第二条起的 TrueHD 暂当附件（默认开，见 `Demuxer.parkUnsizedPGS`）。宿主做新旧对照时可关
-    nonisolated(unsafe) public static var parkSecondaryTrueHDDuringProbe = true
+    /// [MovieClaw P3] 点播第一个分片的切分目标（秒）。nil（默认）即与其余分片相同；MovieClaw 设 1 秒，
+    /// 起播只等一个短分片。夹在 0.5 秒～分片目标之间，均匀切分时仍不短于实测关键帧间隔
+    nonisolated(unsafe) public static var vodFirstSegmentTargetSeconds: Double? = nil {
+        didSet { vodFirstSegmentTargetSeconds = vodFirstSegmentTargetSeconds.map { Swift.max(0.5, $0) } }
+    }
 
-    /// [MovieClaw P45] MKV 索引预热跳到起播点而不是片中间（默认开，见 `HLSVideoEngine.start()` 的 cue prewarm）。宿主做新旧对照时可关
-    nonisolated(unsafe) public static var cuePrewarmTargetsStart = true
+    /// [MovieClaw P34] 探测流时把第二条起的 TrueHD 暂当附件（默认关即上游行为，MovieClaw 打开；见 `Demuxer.parkUnsizedPGS`）
+    nonisolated(unsafe) public static var parkSecondaryTrueHDDuringProbe = false
 
-    /// [MovieClaw P42] 片源字节缓存跨启动保留（默认开）。只在共享实例第一次用到之前改才有效（宿主在建第一个引擎前设），
+    /// [MovieClaw P45] MKV 索引预热跳到起播点而不是片中间（默认关即上游行为，MovieClaw 打开；见 `HLSVideoEngine.start()` 的 cue prewarm）
+    nonisolated(unsafe) public static var cuePrewarmTargetsStart = false
+
+    /// [MovieClaw P42] 片源字节缓存跨启动保留（默认关，MovieClaw 打开）。只在共享实例第一次用到之前改才有效（宿主在建第一个引擎前设），
     /// 真机新旧对照用
-    nonisolated(unsafe) public static var persistsSourceByteCache = true
+    nonisolated(unsafe) public static var persistsSourceByteCache = false
 
     /// [MovieClaw P50] 片源字节缓存每块另记一段暂存范围（默认开，见 `SourceByteCache.recordWriteLocked`）。关掉即每块只记一段
     /// （P50 之前的行为），真机新旧对照用

@@ -13,6 +13,20 @@ The English host API contract is in [docs/api.md](docs/api.md).
 - Full `swift test --jobs 4` is **not green**: the engine XCTest run executed 718 tests (one skipped, one failure), and Swift Testing executed 4,129 tests across 570 suites with 41 issues. These failures include downstream/upstream assumptions about target segment length, keyframe-index trust, SDR transfer labels, initial range size, held-reader/backpressure behavior, source-probe input limits, and the `LoadOptions` inventory. The known APFS allocation-sensitive cache-trim test also fails, as in the original MovieClaw fork. These checks are retained for upstream reconciliation.
 - The app build and real-media results below were measured against the same downstream engine source in MovieClaw. This contribution is a draft for review of the complete extension set, rather than a merge-ready declaration that the upstream suite has passed.
 
+## Opt-in defaults and upstream 7.28.3 (2026-10-07)
+
+- Merged upstream 7.28.3. P38 (in-band HEVC parameter sets) and the tail witness of P18 (partial
+  keyframe index) were taken upstream in #705 and now use upstream's implementation.
+- Every downstream switch now defaults to the stock engine behavior, following the upstream review of
+  PR #703. Previously hard-wired policies gained switches: `vodFirstSegmentTargetSeconds` (P3),
+  `presentsSDRAsSRGB` (P60) and `softwareClockIgnoresEarlyFirstSample` (P13). MovieClaw enables
+  each one explicitly in its `AetherCore` adapter, so the App's behavior is unchanged.
+- P61 now reads the UDF anchor once: Blu-ray first as upstream, UDF-only DVD only when no BDMV exists.
+- The P51 trim test now leaves holes of at least 16 MiB: APFS fills smaller holes between written
+  ranges when it allocates on flush, which made the test's allocation accounting fail.
+- Full `swift test --jobs 8` (Xcode 27.0): 718 XCTest cases (one skipped upstream) and 4,138 Swift
+  Testing cases in 572 suites, all passing.
+
 # MovieClaw 对 AetherEngine 的补丁（我们自己维护的 fork）
 
 基线：上游 [AetherEngine](https://github.com/superuser404notfound/AetherEngine) **7.28.0**（`7de2d5a0dbb8bc60c09be5620a71f8904d7ab60f`，2026-10-06 同步）（LGPL-3.0 + App Store 例外）。

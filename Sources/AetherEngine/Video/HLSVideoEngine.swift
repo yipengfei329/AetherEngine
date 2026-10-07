@@ -862,7 +862,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// a 4 s segment 0 is 43 MB, measured at 0.84 s of producer wait from a NAS on device. A ~1 s
     /// first segment brings that to about a quarter; every later boundary keeps the 4 s cadence
     /// (thresholds F, F+T, F+2T, ... stay absolute, as the planner requires).
-    static let firstSegmentTargetDuration: Double = 1.0
+    /// Opt-in through `AetherEngine.vodFirstSegmentTargetSeconds`; unset, segment 0 uses the same
+    /// target as every other segment.
+    static var firstSegmentTargetDuration: Double {
+        AetherEngine.vodFirstSegmentTargetSeconds.map { Swift.min($0, targetSegmentDuration) } ?? targetSegmentDuration
+    }
 
     /// Live cut target under `LiveJoinProfile.fastZap` (AE#195): cut at every keyframe past 0.5 s, so
     /// segments quantize to the source GOP and the served TARGETDURATION (whose 3 x holdback gates the

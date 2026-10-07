@@ -1202,20 +1202,27 @@ written. Bind a stable source key before spending the prefetched ranges in a loa
 ### Downstream tuning switches
 
 Configure process-wide tuning before playback, rather than racing mutations against active loads.
+Every switch defaults to the stock AetherEngine behavior; a host opts in to each downstream behavior
+explicitly (MovieClaw sets all of them in its `AetherCore` adapter).
 
-| Member | Downstream behavior |
-| --- | --- |
-| `vodSegmentTargetSeconds` | VOD remux target duration; clamped to the supported range, with keyframe spacing still controlling actual cuts. |
-| `servesSegmentsProgressively`, `progressiveFragmentSeconds` | Progressive VOD segment delivery and its fragment duration. |
-| `declaresIndependentMediaSegments` | Advertise independently decodable media segments when the downstream producer emits them. |
-| `parkSecondaryTrueHDDuringProbe` | Keep secondary TrueHD tracks out of the initial stream-info probe, then restore them. |
-| `cuePrewarmTargetsStart` | Warm an MKV index at the requested start rather than the midpoint. |
-| `prefetchesMatroskaCues`, `usesHostMatroskaCues` | Enable index-first Cues prefetch and host-provided compact Cues respectively. |
-| `prioritizesIndexPrefetch` | Use a short initial header request and yield speculative head reads to the index prefetch. |
-| `waitsOnProgressingPrefetch`, `skipsDetourOnSlowLink` | Wait for productive prefetch work, and avoid costly detours on a slow link. |
-| `persistsSourceByteCache` | Retain source ranges across launches; set before the shared cache is first used. |
-| `sourceByteCacheKeepsSpareRuns`, `sourceByteCacheTrimKeepsMetadata` | Retain disjoint runs within a block, and prefer metadata ranges during startup trimming. |
-| `sourceByteCacheWritesInBackground` | Dispatch source-cache writes and eviction to the cache's serial I/O queue. |
-| `removePersistedSourceByteCache()` | Clear the persistent cache directory before the shared cache is first used. |
-| `temporaryVolumeAvailableBytes(importantUsage:)` | Query cached available storage for host and engine budgeting. |
-| `volumeAvailableBytesOverrideForTesting`, `simulateStorageFullUntilUptimeForTesting` | Test-only hooks for constrained storage and ENOSPC recovery. |
+| Member | Default | Downstream behavior when enabled |
+| --- | --- | --- |
+| `vodSegmentTargetSeconds` | 4 | VOD remux target duration; clamped to 1-6 s, with keyframe spacing still controlling actual cuts. |
+| `vodFirstSegmentTargetSeconds` | nil | A shorter cut target for segment 0 only, never below the measured keyframe spacing. |
+| `servesSegmentsProgressively`, `progressiveFragmentSeconds` | off, 0.5 | Progressive VOD segment delivery and its fragment duration. |
+| `declaresIndependentMediaSegments` | off | Advertise independently decodable media segments in the media playlist too. |
+| `seekSnapDecodeBudgetSeconds`, `startSnapDecodeBudgetSeconds` | 0 (off) | Snap a seek or start target to a keyframe when decoding up to it would exceed the budget. |
+| `presentsSDRAsSRGB` | off | Present BT.709-curve SDR as sRGB on iOS and macOS (no effect on tvOS). |
+| `softwareClockIgnoresEarlyFirstSample` | off | Keep the software-path clock at the requested start when the first sample lands before it. |
+| `parkSecondaryTrueHDDuringProbe` | off | Keep secondary TrueHD tracks out of the initial stream-info probe, then restore them. |
+| `cuePrewarmTargetsStart` | off | Warm an MKV index at the requested start rather than the midpoint. |
+| `prefetchesMatroskaCues`, `prefetchesMP4TailMoov` | off | Fetch Matroska Cues or a tail MP4 `moov` in parallel with the header. |
+| `usesHostMatroskaCues` | on | Use host-provided compact Cues (only when `LoadOptions.matroskaCues` is set). |
+| `prioritizesIndexPrefetch` | off | Use a short initial header request and yield speculative head reads to the index prefetch. |
+| `waitsOnProgressingPrefetch`, `skipsDetourOnSlowLink` | off | Wait for productive prefetch work, and avoid costly detours on a slow link. |
+| `persistsSourceByteCache` | off | Retain source ranges across launches; set before the shared cache is first used. |
+| `sourceByteCacheKeepsSpareRuns`, `sourceByteCacheTrimKeepsMetadata` | on | Retain disjoint runs within a block, and prefer metadata ranges during startup trimming. |
+| `sourceByteCacheWritesInBackground` | on | Dispatch source-cache writes and eviction to the cache's serial I/O queue. |
+| `removePersistedSourceByteCache()` | - | Clear the persistent cache directory before the shared cache is first used. |
+| `temporaryVolumeAvailableBytes(importantUsage:)` | - | Query cached available storage for host and engine budgeting. |
+| `volumeAvailableBytesOverrideForTesting`, `simulateStorageFullUntilUptimeForTesting` | - | Test-only hooks for constrained storage and ENOSPC recovery. |

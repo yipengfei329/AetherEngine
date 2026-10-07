@@ -1,8 +1,8 @@
 import Foundation
 
 extension AetherEngine {
-    /// [MovieClaw P49] 文件头一到就按 SeekHead 把 Matroska 索引先取回来（默认开；关掉即原样按需读，真机对照用）
-    nonisolated(unsafe) public static var prefetchesMatroskaCues = true
+    /// [MovieClaw P49] 文件头一到就按 SeekHead 把 Matroska 索引先取回来（默认关即上游的按需读；MovieClaw 打开）
+    nonisolated(unsafe) public static var prefetchesMatroskaCues = false
     /// [MovieClaw P58] 宿主给了服务端生成的精简索引（`LoadOptions.matroskaCues`）就用它顶替原索引（默认开；关掉即照旧
     /// 下载原索引，真机对照用）
     nonisolated(unsafe) public static var usesHostMatroskaCues = true

@@ -5736,14 +5736,14 @@ final class SuffixRangeSupport: @unchecked Sendable {
 /// whole file. That body is rejected at the header, before a byte of it is accepted, and the
 /// collected length is capped besides, so a lying `Content-Range` cannot grow this either.
 extension AetherEngine {
-    /// [MovieClaw P53] 读到在途提前取（尾部预读 / Matroska 索引）的范围时，只要它还在往回送就一直等（默认开；
+    /// [MovieClaw P53] 读到在途提前取（尾部预读 / Matroska 索引）的范围时，只要它还在往回送就一直等（默认关，MovieClaw 打开；
     /// 关掉即原来按往返时长定的等待上限，对照用）
-    nonisolated(unsafe) public static var waitsOnProgressingPrefetch = true
-    /// [MovieClaw P55] 实测线路慢到一整块旁路补取在限时内到不齐时，回跳直接重连流式读、不走旁路（默认开；对照用）
-    nonisolated(unsafe) public static var skipsDetourOnSlowLink = true
-    /// [MovieClaw P56] 冷打开时文件头第一个请求只要 512 KB，索引提前取在途时文件头不超前预读（默认开；关掉即
+    nonisolated(unsafe) public static var waitsOnProgressingPrefetch = false
+    /// [MovieClaw P55] 实测线路慢到一整块旁路补取在限时内到不齐时，回跳直接重连流式读、不走旁路（默认关，MovieClaw 打开）
+    nonisolated(unsafe) public static var skipsDetourOnSlowLink = false
+    /// [MovieClaw P56] 冷打开时文件头第一个请求只要 512 KB，索引提前取在途时文件头不超前预读（默认关，MovieClaw 打开；关掉即
     /// 一开始就要 32 MB、与索引并行，对照用）
-    nonisolated(unsafe) public static var prioritizesIndexPrefetch = true
+    nonisolated(unsafe) public static var prioritizesIndexPrefetch = false
 }
 
 private final class TailPrefetchDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {

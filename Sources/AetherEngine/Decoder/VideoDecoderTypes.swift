@@ -146,8 +146,9 @@ enum ColorAttachments {
     /// 我不是大师 S01E17 against the decoded frame, midtones +8~10 code values brighter than Infuse.
     /// Not tvOS: there the picture goes out as a Rec.709 signal and the TV owns the curve, so a BT.709
     /// tag is already pass-through and an sRGB one would be converted into it.
+    /// Opt-in through `AetherEngine.presentsSDRAsSRGB`; off, SDR keeps its BT.709 presentation.
     #if os(macOS) || os(iOS)
-    static let presentsSDRAsSRGB = true
+    static var presentsSDRAsSRGB: Bool { AetherEngine.presentsSDRAsSRGB }
     #else
     static let presentsSDRAsSRGB = false
     #endif
@@ -178,4 +179,10 @@ enum ColorAttachments {
     static func isHDRTransfer(_ trc: AVColorTransferCharacteristic) -> Bool {
         trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67
     }
+}
+
+extension AetherEngine {
+    /// [MovieClaw P60] iPhone / Mac 上按 BT.709 曲线显示的 SDR（含未标注）改标 sRGB，对齐 Infuse 的亮度
+    /// （见 `ColorAttachments.presentsSDRAsSRGB`）。默认关即上游行为；Apple TV 上无效。建第一个引擎前设
+    nonisolated(unsafe) public static var presentsSDRAsSRGB = false
 }

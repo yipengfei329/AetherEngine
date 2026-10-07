@@ -33,8 +33,9 @@ enum DiscReader {
     /// Emits `.demux` diagnostics once the UDF anchor is confirmed so a disc image
     /// that fails recognition is debuggable (it would otherwise fall back to a raw
     /// FFmpeg open that reports a bare INVALIDDATA). Non-disc sources stay silent.
-    static func wrapBluRay(_ reader: IOReader, selectTitleID: Int? = nil, cacheKey: String? = nil) throws -> DiscInfo? {
-        guard looksLikeUDF(reader) else { return nil }
+    static func wrapBluRay(_ reader: IOReader, selectTitleID: Int? = nil, cacheKey: String? = nil,
+                           udfAnchorChecked: Bool = false) throws -> DiscInfo? {
+        guard udfAnchorChecked || looksLikeUDF(reader) else { return nil }
         EngineLog.emit("[disc] UDF anchor present; attempting Blu-ray BDMV", category: .demux)
         let udf: UDFReader
         do { udf = try UDFReader(reader: reader) }
@@ -265,9 +266,12 @@ enum DiscReader {
                             dvdTimeMap: cached.dvdTimeMap)
         }
         guard looksLikeISO9660(reader) else {
-            // [MovieClaw P61] 只有 UDF、没有 ISO9660 桥接卷的 DVD 镜像：按 UDF 读 VIDEO_TS
-            if let dvd = wrapUDFDVD(reader, selectTitleID: selectTitleID, cacheKey: cacheKey) { return dvd }
-            return try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey)
+            // UDF 签名只读一次：探测按读量计费（ProbeControlTests 的开头读量上限）
+            guard looksLikeUDF(reader) else { return nil }
+            if let bd = try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey,
+                                       udfAnchorChecked: true) { return bd }
+            // [MovieClaw P61] 只有 UDF、没有 ISO9660 桥接卷的 DVD 镜像：没有 BDMV 时按 UDF 读 VIDEO_TS
+            return wrapUDFDVD(reader, selectTitleID: selectTitleID, cacheKey: cacheKey)
         }
         let iso: ISO9660Reader
         do {
@@ -290,8 +294,9 @@ enum DiscReader {
     /// [MovieClaw P61] UDF-only DVD-Video 镜像（没有 ISO9660 桥接卷，第 16 扇区直接是 UDF 的 BEA01）：原来只认
     /// ISO9660 的 DVD，这种盘落到蓝光分支、找不到 BDMV，退回把整个镜像当裸文件解复用，放出来是菜单那几秒。
     /// VIDEO_TS 改经 UDF 列出（DVD 的 VOB / IFO 在盘上都是连续的一段；分成多段的文件跳过），其余与 ISO9660 同一套
+    /// 调用方已确认 UDF 锚点
     static func wrapUDFDVD(_ reader: IOReader, selectTitleID: Int?, cacheKey: String?) -> DiscInfo? {
-        guard looksLikeUDF(reader), let udf = try? UDFReader(reader: reader),
+        guard let udf = try? UDFReader(reader: reader),
               let root = try? udf.list(path: []),
               let dir = root.first(where: { $0.isDir && $0.name.uppercased() == "VIDEO_TS" }),
               let entries = try? udf.list(path: [dir.name]) else { return nil }

@@ -1,8 +1,8 @@
 import Foundation
 
 extension AetherEngine {
-    /// [MovieClaw P54] 文件头一到就按顶层盒子找出尾部 moov，与开容器并行先取回来（默认开；关掉即原样按需读，对照用）
-    nonisolated(unsafe) public static var prefetchesMP4TailMoov = true
+    /// [MovieClaw P54] 文件头一到就按顶层盒子找出尾部 moov，与开容器并行先取回来（默认关即上游的按需读；MovieClaw 打开）
+    nonisolated(unsafe) public static var prefetchesMP4TailMoov = false
 }
 
 /// [MovieClaw P54] 从 MP4 / MOV 文件头的字节里判断 moov 在不在文件尾、从哪里开始。

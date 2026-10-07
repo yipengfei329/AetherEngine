@@ -25,11 +25,12 @@ enum SWClockAnchorPolicy {
     static func resolve(initialSeconds: Double,
                         firstSampleSeconds: Double,
                         toleranceSeconds: Double = SWClockAnchorPolicy.toleranceSeconds) -> Resolution {
-        // [MovieClaw P13] 只有首个样本「晚于」起播点才算中途加入。早于起播点是粗粒度定位落在了前面（DVD 时间表
+        // [MovieClaw P13]（`softwareClockIgnoresEarlyFirstSample` 打开时）只有首个样本「晚于」起播点才算中途加入。早于起播点是粗粒度定位落在了前面（DVD 时间表
         // 16 秒一格、长 GOP 的关键帧），时钟仍锚在起播点、之前的帧跳过；原来一律按首个样本锚，《聪明的一休》
         // 续播落在 12 秒前，画面要等时钟真的走到起播点才出，起播 8.9 秒
+        let deviation = firstSampleSeconds - initialSeconds
         guard firstSampleSeconds.isFinite,
-              firstSampleSeconds - initialSeconds > toleranceSeconds else {
+              (AetherEngine.softwareClockIgnoresEarlyFirstSample ? deviation : abs(deviation)) > toleranceSeconds else {
             return Resolution(anchorSeconds: initialSeconds, sessionZeroSeconds: 0)
         }
         return Resolution(anchorSeconds: firstSampleSeconds,
@@ -89,4 +90,10 @@ enum SWClockAnchorPolicy {
         guard !clockArmed, isPlaying, !rendererReadyForMoreData else { return false }
         return !audioArmingStillPossible
     }
+}
+
+extension AetherEngine {
+    /// [MovieClaw P13] 软件通路首个样本早于起播点（粗粒度定位落在前面）时，时钟仍锚在起播点、之前的帧跳过。
+    /// 默认关即上游行为（偏差超过容差就按首个样本重新锚定）
+    nonisolated(unsafe) public static var softwareClockIgnoresEarlyFirstSample = false
 }

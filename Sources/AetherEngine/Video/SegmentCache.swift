@@ -989,13 +989,13 @@ final class SegmentCache: @unchecked Sendable {
 
 extension AetherEngine {
     /// [MovieClaw P57] 点播分片边产出边送：分片正在写时本机服务器就开始按块发，封装器在分片内每
-    /// `progressiveFragmentSeconds` 刷出一个片段（默认开；关掉即原来的整段写完再交付、8 秒刷一次，对照用）
-    nonisolated(unsafe) public static var servesSegmentsProgressively = true
+    /// `progressiveFragmentSeconds` 刷出一个片段（默认关即上游的整段写完再交付、8 秒刷一次；MovieClaw 打开）
+    nonisolated(unsafe) public static var servesSegmentsProgressively = false
     /// [MovieClaw P57] 边产出边送时分片内片段的长度（秒）。Mac 实测 6 Mbit/s 下 4K 长 GOP 片：1 秒时从头播 3.1 秒开播，
     /// 0.5 秒时 1.8 秒；每个片段多一个几百字节的 moof 头，可以忽略
     nonisolated(unsafe) public static var progressiveFragmentSeconds: Double = 0.5
-    /// [MovieClaw P59] 点播媒体播放列表也声明 EXT-X-INDEPENDENT-SEGMENTS（默认开；关掉即只有主播放列表声明，对照用）
-    nonisolated(unsafe) public static var declaresIndependentMediaSegments = true
+    /// [MovieClaw P59] 点播媒体播放列表也声明 EXT-X-INDEPENDENT-SEGMENTS（默认关即上游的只有主播放列表声明；MovieClaw 打开）
+    nonisolated(unsafe) public static var declaresIndependentMediaSegments = false
 }
 
 /// 取到的分片：要么已经写完（完整字节），要么正在写（边写边读）
