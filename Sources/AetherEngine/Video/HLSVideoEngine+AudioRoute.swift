@@ -220,7 +220,7 @@ extension HLSVideoEngine {
                 doviConfig: vcfg.doviConfig,
                 colorOverride: vcfg.colorOverride,
                 extradataOverride: vcfg.extradataOverride,
-                annexBSamplesKeepParameterSets: vcfg.annexBSamplesKeepParameterSets
+                convertsAnnexBSamples: vcfg.convertsAnnexBSamples
             )
             let probeAudio = MP4SegmentMuxer.AudioConfig(
                 codecpar: cfg.codecpar,

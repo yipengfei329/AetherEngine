@@ -49,7 +49,7 @@ extension HLSVideoEngine {
     /// interleaver before its first flush, which on a 110 min Blu-ray climbed to ~13 GB of RAM and
     /// swapped until the device disk filled.
     ///
-    /// Two witnesses, both required:
+    /// Three witnesses, all required:
     ///
     /// - **Gap (#64)**: the largest gap between consecutive keyframes. A real index never gaps more than
     ///   a few GOPs (well under the cap); a clustered TS index gaps by thousands of seconds.
@@ -61,16 +61,14 @@ extension HLSVideoEngine {
     ///   whole-file segment, from which AVPlayer loads zero tracks. Below one segment of coverage the
     ///   keyframe planner cannot make even the first cut, so such an index is rejected here.
     ///
-    /// Coverage is the span between keyframes, never reaching to EOF, so a dense index that stops early
-    /// (the trailing-gap-not-counted case) is unaffected: its span already exceeds one segment.
+    /// - **Tail (PR #703)**: the span must also reach to within `maxTrailingGapSeconds` of the source
+    ///   duration. An index that stops minutes short is not dense-but-short, it is a partial scan: an
+    ///   MKV whose Cues are missing or point past EOF (an incomplete download) leaves only what the
+    ///   capped prewarm walked, and the keyframe planner then cuts its last segment from the final
+    ///   scanned keyframe to the end of the title (measured on a device: 205 s to 5933 s), which the
+    ///   producer can never finish and AVPlayer waits on forever. The 60 s default leaves room for a
+    ///   long final GOP and for a container duration padded by a trailing audio or subtitle track.
     ///
-    /// [MovieClaw P18] A third witness, **tail**: the span must also reach to within `maxTrailingGapSeconds` of the
-    /// source duration. An index that stops early by minutes is not "dense but short", it is a partial scan:
-    /// an MKV whose Cues are missing or point past EOF (an incomplete download) leaves only what the capped
-    /// prewarm walked, and the keyframe planner then emits a last segment from the final scanned keyframe to
-    /// the end of the title (device, 2026-09-28: 205 s → 5933 s), which the producer can never finish and
-    /// AVPlayer waits on forever. 60 s tolerates a long final GOP or a container duration padded by a
-    /// trailing audio / subtitle track.
     /// An index failing any witness is routed to the uniform-stride fallback.
     static func keyframeIndexIsTrustworthy(
         keyframes: [Int64],
@@ -88,7 +86,7 @@ extension HLSVideoEngine {
         // In Double: an index spanning both Int64 extremes overflows the integer difference (audit HLS-102).
         let coverageSeconds = (Double(sorted[sorted.count - 1]) - Double(sorted[0])) * tb
         guard coverageSeconds >= minCoverageSeconds else { return false }
-        guard sourceDurationSeconds - coverageSeconds <= maxTrailingGapSeconds else { return false }  // [MovieClaw P18]
+        guard sourceDurationSeconds - coverageSeconds <= maxTrailingGapSeconds else { return false }
         var largestGapSeconds = 0.0
         for i in 1..<sorted.count {
             let gapSeconds = (Double(sorted[i]) - Double(sorted[i - 1])) * tb
@@ -606,8 +604,9 @@ extension HLSVideoEngine {
         /// never going to reformat this track anyway). Callers fall back to deriving it from the
         /// extradata, which is only safe while the two agree.
         let measuredFraming: VideoNALFraming?
-        /// [MovieClaw P38] 样本仍是 Annex B，但配置记录已换成 hvcC：封装层自己把样本转成长度前缀、保留带内参数集
-        var annexBSamplesKeepParameterSets = false
+        /// The packets are Annex B and `extradataOverride` is a length-prefixed record: the muxer
+        /// converts every sample itself and keeps its in-band parameter sets (`AnnexBSampleConverter`).
+        var convertsAnnexBSamples = false
     }
 
     /// Measure the video NAL framing on packets, then decide what config record the muxer gets.
@@ -644,8 +643,8 @@ extension HLSVideoEngine {
 
         let framing = probeVideoNALFraming(demuxer: demuxer, videoStreamIndex: videoStreamIndex)
         guard case .lengthPrefixed = framing else {
-            // The record stays Annex B here: movenc reads it to decide whether to convert the samples,
-            // and these samples do need converting. What it must not keep is a prefix SEI, because the
+            // Except for HEVC on Annex-B packets (below) the record stays Annex B: movenc reads it to
+            // decide whether to convert the samples, and these samples do need converting. What it must not keep is a prefix SEI, because the
             // hvcC movenc then builds carries it as a fourth array (`ff_isom_write_hvcc` collects five
             // NAL types) and Apple TV's HEVC track builder rejects such a record (AE#187). That defense
             // sits on the record path and cannot see this one, so the SEI goes before the muxer runs.
@@ -654,6 +653,25 @@ extension HLSVideoEngine {
             } ?? []
             let canonical = codecID == AV_CODEC_ID_HEVC
                 ? VideoConfigRecord.canonicalizeAnnexBHEVCConfigRecord(source) : nil
+            // HEVC on conclusively Annex-B packets: movenc's own conversion drops every in-band
+            // parameter set under `hvc1`, which breaks a stream that sends a new PPS mid-title. Give
+            // it a length-prefixed record so it copies the samples, and convert them in the muxer
+            // instead, parameter sets kept. Built from the canonical record so the hvcC carries no
+            // SEI array (AE#187).
+            if codecID == AV_CODEC_ID_HEVC, case .annexB? = framing,
+               let record = VideoConfigRecord.fromAnnexB(
+                   canonical ?? source, codecID: codecID,
+                   width: codecpar.pointee.width, height: codecpar.pointee.height) {
+                EngineLog.emit(
+                    "[HLSVideoEngine] #365 HEVC on Annex-B packets: the muxer gets a length-prefixed "
+                    + "record (\(source.count) B → \(record.count) B) and converts the samples itself, "
+                    + "keeping their in-band parameter sets",
+                    category: .session
+                )
+                var result = VideoFramingNormalization(extradataOverride: record, measuredFraming: framing)
+                result.convertsAnnexBSamples = true
+                return result
+            }
             EngineLog.emit(
                 "[HLSVideoEngine] #365 the muxer will reformat this track's samples and the packets "
                 + "are \(framing == nil ? "not conclusively framed" : "Annex B"); the muxer builds the "
@@ -664,20 +682,6 @@ extension HLSVideoEngine {
                 } ?? ", nothing to drop"),
                 category: .session
             )
-            // [MovieClaw P38] HEVC 点播：movenc 对 hvc1 转换时会剥掉样本里的 VPS/SPS/PPS（filter_ps），init 只剩片头那一套。
-            // 片中换过参数集的原盘（《黑豹2》118 秒、345.7 秒两次换 PPS）续播或播到换点后，硬解拿旧 PPS 解新切片
-            // 报 Cannot Decode，真机只有声音没有画面。改由封装层自己转换并保留带内参数集，配置记录给 hvcC，movenc 不再转换
-            if codecID == AV_CODEC_ID_HEVC, case .annexB = framing,
-               let record = VideoConfigRecord.fromAnnexB(
-                   canonical ?? source, codecID: codecID,
-                   width: codecpar.pointee.width, height: codecpar.pointee.height) {
-                EngineLog.emit(
-                    "[HLSVideoEngine] [MovieClaw P38] HEVC Annex B 样本由封装层转换并保留带内参数集（配置记录 \(source.count) B → hvcC \(record.count) B）",
-                    category: .session)
-                var result = VideoFramingNormalization(extradataOverride: record, measuredFraming: framing)
-                result.annexBSamplesKeepParameterSets = true
-                return result
-            }
             return VideoFramingNormalization(extradataOverride: canonical, measuredFraming: framing)
         }
 
