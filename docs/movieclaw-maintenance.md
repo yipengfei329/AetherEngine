@@ -11,9 +11,19 @@ its AetherCore adapter, product behavior, dependency lock, and real-media tests.
   and merge selected upstream commits or tags using Git; do not overwrite sources.
 - Inspect upstream additions against PATCHES.md. Resolve conflicts and update
   regressions when a downstream policy intentionally differs from upstream.
-- Keep upstream contributions focused and reviewable. PR descriptions use English.
-  The initial extension contribution is draft PR
-  [#703](https://github.com/superuser404notfound/AetherEngine/pull/703).
+- Every downstream behavior defaults to the stock engine; MovieClaw turns each one on
+  in `AetherPlayback.configureEngine()` (AetherCore) and checks the set in
+  `EngineConfigurationTests`. A new downstream behavior follows the same rule, so the
+  full `swift test` stays green and the change can go upstream as it is.
+- Keep upstream contributions focused and reviewable: one change per PR, branched from
+  `upstream/main`, English comments without patch tags, `CHANGELOG.md` and docs in the
+  same commit, full `swift test` green. PR #703 stays open as the reference for the
+  whole set. Submitted from it: #719 (P19), #720 (P8), #721 (P57). P24 is held back:
+  it no longer reproduces on 7.28.3, whose dispatch already routes the original case
+  to the software path.
+- When upstream merges one of them, merge the upstream release, keep upstream's
+  version, delete the downstream copy, and move MovieClaw to the upstream API
+  (P57 becomes `LoadOptions.progressiveSegmentDelivery`, set by AetherCore per load).
 
 ## Validate before adoption
 
