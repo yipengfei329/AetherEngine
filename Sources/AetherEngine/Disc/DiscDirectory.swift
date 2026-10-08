@@ -67,7 +67,7 @@ public final class HTTPDiscDirectoryReader: DiscDirectoryReader, @unchecked Send
 
 /// 把若干个独立文件按顺序首尾相接成一条连续、可跳转的字节流（原盘目录里主片的各个 m2ts）。
 /// 文件读取器按需打开、只留最近用过的几个：多剪辑主片动辄三四十段，不必一次开齐几十条连接。
-final class MultiFileConcatIOReader: IOReader, @unchecked Sendable {
+final class MultiFileConcatIOReader: IOReader, SourceTransferCounting, @unchecked Sendable {
     struct Segment {
         let path: String
         let size: Int64
@@ -85,6 +85,14 @@ final class MultiFileConcatIOReader: IOReader, @unchecked Sendable {
     private var position: Int64 = 0
     /// 已打开的段：下标 → 读取器；`recent` 记使用先后，超上限关掉最久没用的
     private var open: [Int: IOReader] = [:]
+    /// 已关掉的文件读取器拉过的字节（上游 `SourceTransferCounting`）：文件读取器按需开关，计数不能随它一起丢
+    private var retiredSourceBytes: Int64 = 0
+
+    /// 原盘目录的源字节（遥测「已从源拉取」）：开着的各文件读取器加上已关掉的
+    var sourceBytesFetched: Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return retiredSourceBytes + open.values.reduce(0) { $0 + ((($1 as? SourceTransferCounting)?.sourceBytesFetched) ?? 0) }
+    }
     private var recent: [Int] = []
 
     init(segments: [Segment], opener: @escaping @Sendable (String) -> IOReader?) {
@@ -112,7 +120,10 @@ final class MultiFileConcatIOReader: IOReader, @unchecked Sendable {
         recent.append(index)
         while recent.count > Self.openLimit {
             let evicted = recent.removeFirst()
-            open.removeValue(forKey: evicted)?.close()
+            if let gone = open.removeValue(forKey: evicted) {
+                retiredSourceBytes += (gone as? SourceTransferCounting)?.sourceBytesFetched ?? 0
+                gone.close()
+            }
         }
         return fresh
     }
@@ -168,6 +179,7 @@ final class MultiFileConcatIOReader: IOReader, @unchecked Sendable {
     func close() {
         lock.lock()
         let readers = Array(open.values)
+        retiredSourceBytes += readers.reduce(0) { $0 + ((($1 as? SourceTransferCounting)?.sourceBytesFetched) ?? 0) }
         open.removeAll()
         recent.removeAll()
         lock.unlock()

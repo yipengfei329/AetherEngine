@@ -153,7 +153,8 @@ final class MP4SegmentMuxer {
     /// Same volume as cache adopt target so rename is metadata-only.
     private let sessionDir: URL
     private var currentStagingPath: URL
-    /// [MovieClaw P57] 当前分片的暂存文件：只往后追加，封口时原样改名进缓存，所以可以边写边读
+    /// The current segment's staging file. Only appended to, then renamed as it stands on adoption,
+    /// which is what lets progressive delivery read it while it is written.
     var stagingURL: URL { currentStagingPath }
     private var fd: Int32 = -1
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
@@ -286,6 +287,7 @@ final class MP4SegmentMuxer {
         maxBufferedFragmentSeconds: Double = 8.0,
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioDelaySeconds: Double = 0,
+        onStorageExhausted: (@Sendable () -> Void)? = nil,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
@@ -318,12 +320,19 @@ final class MP4SegmentMuxer {
         let firstPath = Self.stagingPath(forSegmentIndex: initialSegmentIndex,
                                          in: sessionDir)
         self.currentStagingPath = firstPath
-        let firstFd = try Self.openPosix(path: firstPath)
+        let firstFd: Int32
+        do {
+            firstFd = try Self.openPosix(path: firstPath)
+        } catch {
+            if Self.isOutOfSpace(error) { onStorageExhausted?() }
+            throw error
+        }
         self.fd = firstFd
 
         // Ref-typed counter shared with the splitter closure (closure can't capture self during init).
         let counter = ByteCounter()
         counter.fd = firstFd
+        counter.onStorageExhausted = onStorageExhausted
         self.byteCounter = counter
 
         self.splitter = FragmentSplitter(
@@ -340,7 +349,7 @@ final class MP4SegmentMuxer {
                 guard !counter.writeFailed, counter.fd >= 0 else { return }
                 // [MovieClaw P25] 测试钩子：模拟播放中存储被写满
                 if AetherEngine.storageFullSimulated {
-                    SegmentCache.markStorageExhausted()
+                    counter.onStorageExhausted?()
                     counter.writeFailed = true
                     return
                 }
@@ -350,8 +359,7 @@ final class MP4SegmentMuxer {
                     if n < 0 {
                         let err = errno
                         if err == EINTR { continue }
-                        // [MovieClaw P25] 写满了：记下来，泵失败时报「存储已满」而不是笼统的封装失败
-                        if err == ENOSPC { SegmentCache.markStorageExhausted() }
+                        if err == ENOSPC { counter.onStorageExhausted?() }
                         counter.writeFailed = true
                         return
                     }
@@ -915,6 +923,7 @@ final class MP4SegmentMuxer {
             self.currentSegmentIndex = nextIdx
             byteCounter.fd = nextFd
         } catch {
+            if Self.isOutOfSpace(error) { byteCounter.onStorageExhausted?() }
             // isWedged: splitter would silently discard next fragment bytes until the pump failed a cut later.
             EngineLog.emit(
                 "[MP4SegmentMuxer] open next staging file seg-\(nextIdx) FAILED: \(error)",
@@ -989,6 +998,11 @@ final class MP4SegmentMuxer {
             throw MuxerError.openStagingFileFailed(errno: errno)
         }
         return fd
+    }
+
+    private static func isOutOfSpace(_ error: Error) -> Bool {
+        if case MuxerError.openStagingFileFailed(let code) = error { return code == ENOSPC }
+        return false
     }
 
     // MARK: - Internal cleanup
@@ -1237,6 +1251,8 @@ private final class ByteCounter {
     var fd: Int32 = -1
     var bytesWrittenCurrentSegment: Int = 0
     var writeFailed: Bool = false
+    /// Reports a staging write that hit a full volume to the session's cache.
+    var onStorageExhausted: (@Sendable () -> Void)?
     var lifetimeFragmentBytes: Int = 0
     var fragmentCuts: Int = 0
 }

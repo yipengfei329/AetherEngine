@@ -394,13 +394,14 @@ enum SessionOptionCorrection {
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "isLive", "audioOnly",
         "dvrWindowSeconds",
-        "liveBlockingReload", "liveJoinProfile", "liveJoinStartsImmediately", "vodStartsImmediately",
-        "audioTrackOrdinal", "sourceCacheKey", "matroskaCues",  // [MovieClaw P11 / P22 / P58] tuning, not identity
+        "softwareDVRRetention",
+        "liveBlockingReload", "liveJoinProfile", "sourceOpenPolicy", "liveStartupGraceSeconds", "liveStartupSingleSegmentMinimumSeconds", "liveJoinStartsImmediately",
+        "vodStartsImmediately", "audioTrackOrdinal", "sourceCacheKey", "matroskaCues",  // [MovieClaw P2 / P11 / P22 / P58] tuning, not identity
         "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback",
         "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "preferredAudioLanguages",
-        "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "backwardBufferSegments", "autoplay",
+        "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "backwardBufferSegments", "progressiveSegmentDelivery", "autoplay",
         "audioDelaySeconds", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
         "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
     ]

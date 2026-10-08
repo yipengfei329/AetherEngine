@@ -90,6 +90,13 @@ struct DemuxerOpenProfile: Sendable {
     /// one reader's generation counter as several concurrent connections, because nothing in the line
     /// distinguished them. Defaults to the pump, since every other path builds its profile explicitly.
     var readerLabel: String = "pump"
+    var sourceOpenPolicy: SourceOpenPolicy = .init()
+
+    func withSourceOpenPolicy(_ policy: SourceOpenPolicy) -> DemuxerOpenProfile {
+        var copy = self
+        copy.sourceOpenPolicy = policy
+        return copy
+    }
 
     /// Whether a probe of an untagged 10-bit HEVC source may read its first RPU to find a Dolby Vision
     /// Profile 5 the container never recorded (`DolbyVisionRecordAudit.addRecordIfProfile5`). On for every
@@ -817,6 +824,7 @@ public final class Demuxer: @unchecked Sendable {
             boundedInitialFetch: openProfile.boundedInitialFetch,
             sequentialOnly: openProfile.avioSequentialOnly,
             heldConnection: openProfile.avioHeldConnection,
+            sourceOpenPolicy: openProfile.sourceOpenPolicy,
             expectsHeadPlayback: openProfile.playbackStartsAtHead,
             hostMatroskaCues: openProfile.hostMatroskaCues   // [MovieClaw P58]
         )

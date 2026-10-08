@@ -723,12 +723,30 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let iFrameSourceLock = NSLock()
     private var _iFrameSource: IFrameSegmentSource?
     private let isLive: Bool
+    /// `LoadOptions.progressiveSegmentDelivery`, read for VOD only (see `fetchesProgressively`).
+    private let servesSegmentsProgressively: Bool
     /// Sequential-origin session: playlist grows with finalized real durations (see _seqDurations).
     private let sequentialAppendPlaylist: Bool
     /// Drives both playlist firstVisible and cache eviction cutoff so they never drift.
-    private let liveWindowSizing: LiveWindowSizing
+    private let baseLiveWindowSizing: LiveWindowSizing
+    private let nativeLiveDVRPolicy: LiveDVRRetentionPolicy?
+    private var liveWindowSizing: LiveWindowSizing {
+        guard let limits = nativeLiveDVRPolicy?.snapshot else { return baseLiveWindowSizing }
+        return LiveWindowSizing(targetSegmentDurationSeconds: baseLiveWindowSizing.targetSegmentDurationSeconds,
+                                dvrWindowSeconds: limits.windowSeconds, retentionBudgetBytes: limits.retentionBytes)
+    }
+
+    /// Reconcile playlist and cache off the caller's actor; this never rebuilds the source/player.
+    func applyNativeLiveDVRRetention() {
+        guard isLive, nativeLiveDVRPolicy?.snapshot != nil else { return }
+        cache.applyNativeLiveRetentionFloor(notePlaylistBuild().firstVisible)
+    }
     /// Only `.fastZap` sessions may serve a shallow first window after a bounded grace.
     private let allowsBoundedDegradedStart: Bool
+    private let startupGraceSeconds: TimeInterval?
+    private let singleSegmentStartupMinimumSeconds: TimeInterval?
+    /// Report the selected startup policy once per session, including repeat requests.
+    private var didLogStartupPolicy = false
     /// AE#594 arm B: skip the bounded branch, so the wait ends at the full holdback cushion or at the
     /// outer wall-clock deadline. Measurement arm, off unless the environment asks for it.
     private let boundedStartFloorsAtHoldback: Bool
@@ -961,9 +979,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         sourceBitrate: Int64,
         audioLanguage: String? = nil,
         isLive: Bool = false,
+        servesSegmentsProgressively: Bool = false,
         sequentialAppendPlaylist: Bool = false,
         liveWindowSizing: LiveWindowSizing = LiveWindowSizing(targetSegmentDurationSeconds: 4.0, dvrWindowSeconds: nil),
+        nativeLiveDVRPolicy: LiveDVRRetentionPolicy? = nil,
         allowsBoundedDegradedStart: Bool = false,
+        startupGraceSeconds: TimeInterval? = nil,
+        singleSegmentStartupMinimumSeconds: TimeInterval? = nil,
         boundedStartFloorsAtHoldback: Bool = false,
         firstServeLatchCoversEngineCut: Bool = false,
         blockingReloadOverride: Bool? = nil,
@@ -992,9 +1014,17 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.cache = cache
         self.segments = segments
         self.isLive = isLive
+        self.servesSegmentsProgressively = servesSegmentsProgressively
         self.sequentialAppendPlaylist = sequentialAppendPlaylist
-        self.liveWindowSizing = liveWindowSizing
+        self.baseLiveWindowSizing = liveWindowSizing
+        self.nativeLiveDVRPolicy = nativeLiveDVRPolicy
         self.allowsBoundedDegradedStart = allowsBoundedDegradedStart
+        self.singleSegmentStartupMinimumSeconds = singleSegmentStartupMinimumSeconds.flatMap {
+            $0.isFinite && $0 > 0 ? $0 : nil
+        }
+        self.startupGraceSeconds = startupGraceSeconds.flatMap {
+            $0.isFinite && $0 >= 0 ? min(120, $0) : nil
+        }
         self.boundedStartFloorsAtHoldback = boundedStartFloorsAtHoldback
         self.firstServeLatchCoversEngineCut = firstServeLatchCoversEngineCut
         self.blockingReloadOverride = blockingReloadOverride
@@ -1088,6 +1118,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         firstSegmentCondition.lock()
         firstSegmentCondition.broadcast()
         firstSegmentCondition.unlock()
+        applyNativeLiveDVRRetention()
     }
 
     /// Append the real duration of a finalized sequential-VOD segment (index-contiguous from 0;
@@ -1169,6 +1200,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // own lock, and nesting it inside this one would invert the ordering `evictBelow`'s async hop
         // below exists to avoid.
         let observedBytes = cache.meanEntryBytes
+        let residentFloor = nativeLiveDVRPolicy?.snapshot != nil
+            ? cache.highestResidentIndex.map { cache.contiguousBackwardFloor(from: $0) } : nil
         stateLock.lock()
         defer { stateLock.unlock() }
         refreshCounter += 1
@@ -1186,7 +1219,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // segments exist, do not advance past 0 so AVPlayer's first
             // read sees all produced segments and can establish a live
             // edge without losing a not-yet-buffered position.
-            let newFirst = max(0, total - window)
+            let newFirst = max(0, total - window, residentFloor ?? 0)
             if newFirst > _liveFirstVisible {
                 // RFC 8216 §6.2.2: EXT-X-DISCONTINUITY-SEQUENCE must increment for each
                 // discontinuity-tagged segment that slides out; segments array is never pruned.
@@ -1348,13 +1381,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// Pure lookup for a scrub thumbnail: no side effects, no restarts; nil outside the
     /// resident window or on a cache miss. Works for live and VOD (VOD `segments` carry
     /// `startSeconds` from init); callers gate on session type one layer up.
-    func thumbnailSegment(atSeconds seconds: Double) -> (index: Int, startSeconds: Double, fileURL: URL)? {
+    func thumbnailSegment(atSeconds seconds: Double) -> (index: Int, startSeconds: Double, durationSeconds: Double, fileURL: URL)? {
         stateLock.lock()
         let segs = segments
         stateLock.unlock()
         guard let idx = Self.thumbnailSegmentIndex(atSeconds: seconds, segments: segs) else { return nil }
         guard let url = cache.peekURL(index: idx) else { return nil }
-        return (idx, segs[idx].startSeconds, url)
+        return (idx, segs[idx].startSeconds, segs[idx].durationSeconds, url)
     }
 
     /// AE#441: the oldest position a rewind can actually land on and still play forward, in output
@@ -1433,9 +1466,12 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return _mediaFetchCount &+ _progressiveChunkCount
     }
 
-    /// [MovieClaw P57] 边写边送时服务器每发出一块记一次。AVPlayer 在一条长时间的连接上收一个正在写的分片时不会发新请求，
-    /// 只数请求的 #65 卡死看门狗会把「正在收数据」当成「不再取数」（模拟器慢线路续播实测：卡顿 6 秒后被误判，定位一次又
-    /// 重载一次）。块发得出去说明 AVPlayer 在读这条连接；它真卡死不读了，套接字写满、块发不出去，计数也就不涨
+    /// Chunks of progressively delivered segments the server sent. AVPlayer receiving a segment
+    /// that is still being written over one long connection sends no new request, and the #65 wedge
+    /// watchdog counts requests, so it would read a healthy transfer as AVPlayer no longer fetching
+    /// (seen on the iOS Simulator over a slow link: a 6 s stall declared a wedge, and the recovery
+    /// seek reloaded the item). A chunk that leaves the server is AVPlayer reading; a player that
+    /// truly stops reading fills the socket and the count stops with it.
     private var _progressiveChunkCount: UInt64 = 0
 
     func didDeliverProgressiveChunk(index: Int) {
@@ -1624,7 +1660,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         Self.drain(mediaSegmentSource(at: index, onSlow: onSlow))
     }
 
-    /// [MovieClaw P57] 给本机服务器用：分片正在写时返回边写边读的读取器，服务器边收边发（见 `SegmentCache.fetchSource`）
+    /// The loopback server's entry: a segment being written comes back as a reader over its staging
+    /// file when progressive delivery is on (`SegmentCache.fetchSource`).
     func mediaSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource? {
         guard let onSlow, !isLive else { return serveSource(at: index) }
         let signal = SlowServeSignal(thresholdSeconds: slowServeThresholdSeconds, onSlow: onSlow)
@@ -1632,7 +1669,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return serveSource(at: index)
     }
 
-    /// [MovieClaw P57] 要完整字节的调用方：边写边读的就读到封口（作废时 nil）
+    /// For a caller that needs the whole segment: a progressive source is read to its seal.
     static func drain(_ source: SegmentSource?) -> Data? {
         switch source {
         case .data(let data): return data
@@ -1641,8 +1678,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
     }
 
-    /// [MovieClaw P57] 点播时取分片不必等它写完（直播有自己的窗口与阻塞刷新规则，照旧）
-    private var fetchesProgressively: Bool { !isLive && AetherEngine.servesSegmentsProgressively }
+    private var fetchesProgressively: Bool { !isLive && servesSegmentsProgressively }
 
     private func serveSource(at index: Int) -> SegmentSource? {
         guard index >= 0, index < currentSegmentCount else { return nil }
@@ -1878,8 +1914,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             )
         } else if source != nil {
             EngineLog.emit(
-                "[HLSVideoEngine] seg\(index): [MovieClaw P57] 正在写，边写边送 (wait=\(String(format: "%.1f", elapsedMs))ms "
-                + "cache=\(cache.count) restarted=\(restarted))",
+                "[HLSVideoEngine] seg\(index): serving while it is written "
+                + "(wait=\(String(format: "%.1f", elapsedMs))ms cache=\(cache.count) restarted=\(restarted))",
                 category: .session
             )
         } else {
@@ -2629,12 +2665,21 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return (segments.count, summed, maxDuration)
     }
 
+    /// Only completed, independently decodable media participates. The optional duration threshold
+    /// never cuts a GOP early or weakens the standard/full-holdback path.
+    private func hasBoundedStartupMedia(_ snapshot: (count: Int, summed: Double, maxDuration: Double)) -> Bool {
+        if snapshot.count >= LiveEdgePolicy.minStartupSegments { return true }
+        guard snapshot.count == 1, let minimum = singleSegmentStartupMinimumSeconds else { return false }
+        return snapshot.summed.isFinite && snapshot.summed >= minimum
+    }
+
     /// Block until the first live window holds the live-edge holdback (3 x TARGETDURATION) of content, so
     /// AVPlayer's initial seek to edge-minus-holdback lands inside the window instead of its stall-danger
     /// zone (-16832; AE#189). A `.fastZap` session may take the explicitly bounded shallow-window path
     /// after two segments and one clamped segment-duration grace (AE#208). `.standard` never takes it.
-    /// Both paths avoid -12888 on an empty or single-segment playlist. The gate and served playlist use
-    /// the same sealed TARGETDURATION.
+    /// A caller may also admit one sufficiently long finalized segment through the same bounded path.
+    /// Empty and short single-segment windows still wait. The gate and served playlist use the same
+    /// sealed TARGETDURATION; this changes initial admission only, not live-edge safety or reloads.
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool {
         guard isLive else { return true }
         let deadline = Date().addingTimeInterval(timeout)
@@ -2650,6 +2695,12 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         defer { parkedWaiters -= 1 }
         while true {
             if waitersCancelled { return false }
+            if !didLogStartupPolicy {
+                didLogStartupPolicy = true
+                let grace = startupGraceSeconds.map(LiveEdgePolicy.seconds) ?? "auto"
+                let single = singleSegmentStartupMinimumSeconds.map(LiveEdgePolicy.seconds) ?? "off"
+                EngineLog.emit("[HLSVideoEngine] live startup policy: bounded=\(allowsBoundedDegradedStart) grace=\(grace) singleSegmentMinimum=\(single) holdbackFloor=\(boundedStartFloorsAtHoldback)", category: .session)
+            }
             // AE#684 latched ingest sessions; AE#686 extends it to a source the engine cuts itself,
             // where the second grace bought nothing on device but a session 1 s further from the edge.
             if firstManifestServed, liveCadencePolicy != nil || firstServeLatchCoversEngineCut {
@@ -2670,9 +2721,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             }
             if allowsBoundedDegradedStart,
                !boundedStartFloorsAtHoldback,
-               snap.count >= LiveEdgePolicy.minStartupSegments,
+               hasBoundedStartupMedia(snap),
                degradedDeadline == nil {
-                let grace = LiveEdgePolicy.fastZapDegradedGraceSeconds(
+                let grace = startupGraceSeconds ?? LiveEdgePolicy.fastZapDegradedGraceSeconds(
                     maxSegmentDuration: snap.maxDuration
                 )
                 degradedGrace = grace
@@ -2700,7 +2751,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 }
                 if let degradedDeadline,
                    Date() >= degradedDeadline,
-                   after.count >= LiveEdgePolicy.minStartupSegments {
+                   hasBoundedStartupMedia(after) {
                     let sealed = sealLiveTargetDuration(afterTarget)
                     // AE#374: the grace is the last leg of this wait, not the wait. Reporting it alone
                     // left a bounded start reading as a half-second one when it had held for twelve.
@@ -2750,6 +2801,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         note: String? = nil
     ) {
         firstManifestServed = true
+        firstSegmentCondition.broadcast()
         guard !didAccountForFirstServe else {
             accountForRepeatServe(since: entered, note: note)
             return

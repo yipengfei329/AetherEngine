@@ -531,6 +531,10 @@ public struct LoadOptions: Sendable, Equatable {
     /// DVR rewind window in seconds; nil = live-only (seek is a no-op). Engine retains roughly this much past content disk-backed, bounded by the session disk budget (a quarter of the free space, at most 2 GiB), so a long window on a high-bitrate channel or a small volume holds less than it asks for. Suggested default: 1800. Ignored when `isLive == false`. Default nil.
     public var dvrWindowSeconds: Double?
 
+    /// Opt in to strict software DVR storage bounds and runtime capacity leases.
+    /// Nil preserves the default spool behavior.
+    public var softwareDVRRetention: SoftwareDVRRetentionOptions? = nil
+
     /// LL-HLS blocking-reload (`#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD`) override for live loopback sessions.
     /// nil (default) = auto: for a `LiveIngestSourceInfo` custom reader the engine derives eligibility from
     /// the OBSERVED upstream arrival cadence (off until sustained discipline is proven, permanently off once
@@ -558,6 +562,27 @@ public struct LoadOptions: Sendable, Equatable {
     /// lean-back viewing. Ignored for `nativeRemoteHLS` and VOD. Default `.standard`
     /// (AetherEngine#195/#208).
     public var liveJoinProfile: LiveJoinProfile = .standard
+
+    /// HTTP VOD opening budgets. Applied to the initial playback reader and its reopens;
+    /// live, sequential-only sources and disposable frame probes retain their own policies.
+    public var sourceOpenPolicy: SourceOpenPolicy = .init()
+
+    /// Extra wait after an eligible finalized window for `.fastZap` loopback live joins.
+    /// Nil uses the observed segment duration clamped to 0.5...2 seconds. Zero serves immediately
+    /// once the minimum media exists. Invalid or negative values use the automatic policy.
+    /// A shorter grace can increase early rebuffering on irregular sources. This does not change
+    /// TARGETDURATION, HOLD-BACK, or `.standard` joins. The minimum is two segments unless
+    /// `liveStartupSingleSegmentMinimumSeconds` explicitly permits a sufficiently long first one.
+    public var liveStartupGraceSeconds: Double? = nil
+
+    /// Opt-in minimum media duration for starting a `.fastZap` loopback live session with one
+    /// finalized segment. Nil retains the two-segment minimum. A finite, positive value allows a
+    /// single segment at least that long to enter the same bounded-start grace; shorter segments
+    /// still need a second segment. This avoids waiting for another full GOP on long-GOP sources.
+    /// It does not change segment boundaries, TARGETDURATION, HOLD-BACK or `.standard` joins.
+    /// A shallow initial playlist can rebuffer if the next segment arrives late. Hosts choose
+    /// this latency/resilience tradeoff; invalid values preserve the two-segment minimum.
+    public var liveStartupSingleSegmentMinimumSeconds: Double? = nil
 
     /// Cut AVPlayer's stall-avoidance wait short at the live join, once it is holding on media it has
     /// already buffered. Live sessions on the AVPlayer-backed paths only. Default `false` (AE#440).
@@ -812,6 +837,15 @@ public struct LoadOptions: Sendable, Equatable {
     /// [MovieClaw P25] 分片缓存的后方窗口（段数），nil = 默认 20。存储紧张时由宿主和 `forwardBufferSegments`
     /// 一起收小，让自研引擎在剩余空间不多时照样能放（最少 2 段，见 `HLSVideoEngine.clampedBackwardWindow`）
     public var backwardBufferSegments: Int?
+    /// Serve each VOD loopback segment while it is being written instead of after its cut. The
+    /// muxer flushes a fragment about every half second and the loopback server sends each one as
+    /// it lands, so AVPlayer can show and start on the first fragments of a segment rather than
+    /// waiting for all of it. On a fast or local source a segment is cut long before AVPlayer asks
+    /// for it and nothing changes; on a slow link it is the difference between waiting for a whole
+    /// segment (seconds of a long GOP at the link's rate) and waiting for its first fragment.
+    /// Default false. VOD only: live keeps its own window and blocking-reload contracts. Ignored for
+    /// `nativeRemoteHLS` and on the software path, which serve no loopback segments.
+    public var progressiveSegmentDelivery: Bool = false
 
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
@@ -919,6 +953,9 @@ public struct LoadOptions: Sendable, Equatable {
         dvrWindowSeconds: Double? = nil,
         liveBlockingReload: Bool? = nil,
         liveJoinProfile: LiveJoinProfile = .standard,
+        sourceOpenPolicy: SourceOpenPolicy = .init(),
+        liveStartupGraceSeconds: Double? = nil,
+        liveStartupSingleSegmentMinimumSeconds: Double? = nil,
         liveJoinStartsImmediately: Bool = true,
         clampsLiveResumeToWindow: Bool = true,
         nativeRemoteHLS: Bool = false,
@@ -940,6 +977,7 @@ public struct LoadOptions: Sendable, Equatable {
         externalSubtitles: [ExternalSubtitleTrack] = [],
         forwardBufferSegments: Int? = nil,
         backwardBufferSegments: Int? = nil,
+        progressiveSegmentDelivery: Bool = false,
         autoplay: Bool = true,
         teletextPage: Int? = nil,
         audioDelaySeconds: Double = 0,
@@ -965,6 +1003,9 @@ public struct LoadOptions: Sendable, Equatable {
         self.dvrWindowSeconds = dvrWindowSeconds
         self.liveBlockingReload = liveBlockingReload
         self.liveJoinProfile = liveJoinProfile
+        self.sourceOpenPolicy = sourceOpenPolicy
+        self.liveStartupGraceSeconds = liveStartupGraceSeconds
+        self.liveStartupSingleSegmentMinimumSeconds = liveStartupSingleSegmentMinimumSeconds
         self.liveJoinStartsImmediately = liveJoinStartsImmediately
         self.clampsLiveResumeToWindow = clampsLiveResumeToWindow
         self.nativeRemoteHLS = nativeRemoteHLS
@@ -986,6 +1027,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.externalSubtitles = externalSubtitles
         self.forwardBufferSegments = forwardBufferSegments
         self.backwardBufferSegments = backwardBufferSegments
+        self.progressiveSegmentDelivery = progressiveSegmentDelivery
         self.autoplay = autoplay
         self.teletextPage = teletextPage
         self.audioDelaySeconds = audioDelaySeconds

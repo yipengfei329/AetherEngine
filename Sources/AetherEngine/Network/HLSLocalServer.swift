@@ -17,8 +17,9 @@ protocol HLSSegmentProvider: AnyObject {
     /// Default forwards to `mediaSegment(at:)` without ever signalling.
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data?
 
-    /// [MovieClaw P57] 同上，但分片正在写时可以返回边写边读的读取器，服务器边收边发（点播）。
-    /// 默认包一层 `mediaSegment(at:onSlow:)` 的完整字节
+    /// As above, but a VOD segment that is still being written may come back as a reader over it,
+    /// which the server sends chunk by chunk (`LoadOptions.progressiveSegmentDelivery`). Default
+    /// wraps `mediaSegment(at:onSlow:)`.
     func mediaSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource?
 
     /// Optional file URL for disk-backed segments (cache adopt path). Server streams file -> socket bypassing Foundation Data; sendfile(2) was tried but SIGSYS'd on tvOS sandbox.
@@ -32,7 +33,8 @@ protocol HLSSegmentProvider: AnyObject {
     /// request needs to know whether that request was answered. Default ignores it.
     func didServeMediaSegment(index: Int, delivered: Bool)
 
-    /// [MovieClaw P57] 边写边送的分片又发出去一块（给只数请求的卡死看门狗当「还在取数」的证据）。默认忽略
+    /// One more chunk of a progressively delivered segment left the server: the request-counting
+    /// wedge watchdog's evidence that AVPlayer is still reading. Default ignores it.
     func didDeliverProgressiveChunk(index: Int)
 
     var segmentCount: Int { get }
@@ -1229,8 +1231,10 @@ final class HLSLocalServer: @unchecked Sendable {
                                           data: Self.chunkedResponseHeader(contentType: "video/mp4"),
                                           path: "\(normalizedPath) [early header]")
                     })
-                    // [MovieClaw P57] 分片正在写：先回分块响应头（慢时已提前回过就不再回），边读边按块发出去，
-                    // AVPlayer 收到一个片段就能用一个片段；生产者放弃这段时断开连接，AVPlayer 会重新请求
+                    // A segment being written: commit the chunked header (unless the slow-serve
+                    // signal already did) and send each fragment as it lands. An abandoned segment
+                    // ends the connection without the final chunk, so AVPlayer retries it rather
+                    // than taking the partial bytes for a whole segment.
                     if case .progressive(let reader) = source {
                         if early.markSentOnce() {
                             guard writeAll(fd: fd, data: Self.chunkedResponseHeader(contentType: "video/mp4"),
@@ -1320,11 +1324,9 @@ final class HLSLocalServer: @unchecked Sendable {
     static let chunkFrameTrailer = Data("\r\n".utf8)
     static let chunkedFinal = Data("0\r\n\r\n".utf8)
 
-    /// Body for an early-header serve: the whole segment as one chunk. Four separate send()
-    /// calls so mmap-backed segment Data is never copied into a Swift heap buffer.
-    /// [MovieClaw P57] 边写边读的分片按块发出去：每读到一批（通常就是封装器刚刷出的一个片段）发一块，
-    /// 封口读完发结束块。作废（生产者重启、出错）时不发结束块直接返回 false：连接关掉，AVPlayer 看到的是一次
-    /// 中断的传输、会重试这一段，而不是把残段当成完整分片收下
+    /// Body for a progressively delivered segment: one chunk per read (usually the fragment the muxer
+    /// just flushed), the final chunk once the sealed segment is read to its end. Returns false
+    /// without the final chunk when the producer abandons the segment.
     private func sendProgressiveBody(fd: Int32, path: String, reader: ProgressiveSegmentReader) -> Bool {
         let provider = self.provider
         var sent = 0
@@ -1340,19 +1342,21 @@ final class HLSLocalServer: @unchecked Sendable {
                 provider?.didDeliverProgressiveChunk(index: reader.index)
             case .finished:
                 EngineLog.emit(
-                    "[HLSLocalServer] -> 200 \(path) bytes=\(sent) type=video/mp4 [MovieClaw P57 边写边送]",
+                    "[HLSLocalServer] -> 200 \(path) bytes=\(sent) type=video/mp4 [progressive]",
                     category: .hlsServer, level: .verbose)
                 return writeAll(fd: fd, data: Self.chunkedFinal, path: "\(path) [chunk final]")
             case .abandoned:
                 EngineLog.emit(
-                    "[HLSLocalServer] \(path): [MovieClaw P57] 边写边送到 \(sent) 字节时这段被生产者放弃，"
-                    + "断开连接让 AVPlayer 重新请求",
+                    "[HLSLocalServer] \(path): the producer abandoned this segment after \(sent) B sent; "
+                    + "closing so AVPlayer asks for it again",
                     category: .hlsServer)
                 return false
             }
         }
     }
 
+    /// Body for an early-header serve: the whole segment as one chunk. Four separate send()
+    /// calls so mmap-backed segment Data is never copied into a Swift heap buffer.
     private func sendChunkedBody(fd: Int32, path: String, data: Data) -> Bool {
         EngineLog.emit(
             "[HLSLocalServer] -> 200 \(path) bytes=\(data.count) type=video/mp4 [chunked, early header]",

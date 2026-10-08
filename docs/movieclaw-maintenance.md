@@ -18,7 +18,8 @@ its AetherCore adapter, product behavior, dependency lock, and real-media tests.
 - Keep upstream contributions focused and reviewable: one change per PR, branched from
   `upstream/main`, English comments without patch tags, `CHANGELOG.md` and docs in the
   same commit, full `swift test` green. PR #703 stays open as the reference for the
-  whole set. Submitted from it: #719 (P19), #720 (P8), #721 (P57). P24 is held back:
+  whole set. Taken upstream from it: #719 (P19, 7.31.2), #720 (P8) and #721 (P57, both 7.32.0),
+  plus P38 and the P18 tail witness (#705, 7.28.1). P24 is held back:
   it no longer reproduces on 7.28.3, whose dispatch already routes the original case
   to the software path.
 - When upstream merges one of them, merge the upstream release, keep upstream's
