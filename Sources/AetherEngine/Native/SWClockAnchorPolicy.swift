@@ -11,6 +11,11 @@ import Foundation
 /// sample PTS is the only way they ever present. `sessionZeroSeconds` is the offset
 /// the host subtracts from the raw synchronizer clock so the published position
 /// stays session-relative; the raw clock itself remains the source/subtitle axis.
+///
+/// Only a sample AHEAD of the anchor moves it (AE#724). A resume repositions to the keyframe at or
+/// before its target, so its first audio arrives up to a whole GOP early (9.984 s for a 17.3 s
+/// resume on a 10 s GOP); the video skip threshold and the synchronizer discard that preroll, and
+/// a clock moved back onto it published the viewer seconds behind the resume point.
 enum SWClockAnchorPolicy {
     /// Tolerance below which the first sample is considered aligned with the load
     /// anchor. Head-of-stream offsets are a few hundred ms; mid-stream joins are
@@ -25,28 +30,33 @@ enum SWClockAnchorPolicy {
     static func resolve(initialSeconds: Double,
                         firstSampleSeconds: Double,
                         toleranceSeconds: Double = SWClockAnchorPolicy.toleranceSeconds) -> Resolution {
-        // [MovieClaw P13]（`softwareClockIgnoresEarlyFirstSample` 打开时）只有首个样本「晚于」起播点才算中途加入。早于起播点是粗粒度定位落在了前面（DVD 时间表
-        // 16 秒一格、长 GOP 的关键帧），时钟仍锚在起播点、之前的帧跳过；原来一律按首个样本锚，《聪明的一休》
-        // 续播落在 12 秒前，画面要等时钟真的走到起播点才出，起播 8.9 秒
-        let deviation = firstSampleSeconds - initialSeconds
         guard firstSampleSeconds.isFinite,
-              (AetherEngine.softwareClockIgnoresEarlyFirstSample ? deviation : abs(deviation)) > toleranceSeconds else {
+              firstSampleSeconds - initialSeconds > toleranceSeconds else {
             return Resolution(anchorSeconds: initialSeconds, sessionZeroSeconds: 0)
         }
         return Resolution(anchorSeconds: firstSampleSeconds,
                           sessionZeroSeconds: max(0, firstSampleSeconds - initialSeconds))
     }
 
-    /// [MovieClaw P35] 点播片源在装载时就定下的 session zero：容器起点明显不为 0（超过容差）时取起点，否则 0。
+    /// The session zero a resume establishes before any sample arrives (AE#724).
     ///
-    /// 软件通路原来只在首个样本「晚于」起播点时才得出 session zero（给直播中途加入用）。时间戳从几百秒起的
-    /// 点播片源（《戴珍珠耳环》VC-1 原盘 raw 从 600 秒起），从头播时首样本 600 对起播点 0 会触发、时间轴对；
-    /// 续播到 600 时首样本 600 对起播点 600 不触发，于是整条时间轴按 raw 发布：续播点差 600 秒，
-    /// 跳到 600 秒之前落在第一个包之前、时钟等不到画面，永远卡住（真机每批必现）。主力通路按 AE#270
-    /// 以容器起点为 0，这里对齐同一口径。容差内的小起点（DVD、B 帧 MP4）照旧按 raw，行为不变。
-    static func vodSessionZero(sourceOriginSeconds: Double, isLive: Bool) -> Double {
-        guard !isLive, sourceOriginSeconds.isFinite, sourceOriginSeconds > toleranceSeconds else { return 0 }
+    /// `load(startPosition:)` is a session-axis position like any seek, but on a cold start the
+    /// session zero only exists once `resolve` has seen the first sample. A resume has to cross
+    /// the axes before that, or its target reaches the demuxer unconverted: on a source whose
+    /// timestamps start at 600 s, 17.3 is a position before the first packet, the read lands on
+    /// the head, and the clock publishes 17.3 over content from 0. The origin counts on the same
+    /// terms as on a cold start, so a source starting within the tolerance stays zero-based.
+    static func resumeSessionZero(sourceOriginSeconds: Double,
+                                  toleranceSeconds: Double = SWClockAnchorPolicy.toleranceSeconds) -> Double {
+        guard sourceOriginSeconds.isFinite, sourceOriginSeconds > toleranceSeconds else { return 0 }
         return sourceOriginSeconds
+    }
+
+    /// [MovieClaw P35] The session zero a VOD load presets from the container origin, whether or not it
+    /// resumes: a play from the head anchors on the origin too, so the first sample does not re-anchor and
+    /// disc chapter jumps can subtract it. Live keeps the first-sample re-anchor.
+    static func vodSessionZero(sourceOriginSeconds: Double, isLive: Bool) -> Double {
+        isLive ? 0 : resumeSessionZero(sourceOriginSeconds: sourceOriginSeconds)
     }
 
     /// Converts a session-axis position into the source axis.
@@ -93,7 +103,8 @@ enum SWClockAnchorPolicy {
 }
 
 extension AetherEngine {
-    /// [MovieClaw P13] 软件通路首个样本早于起播点（粗粒度定位落在前面）时，时钟仍锚在起播点、之前的帧跳过。
-    /// 默认关即上游行为（偏差超过容差就按首个样本重新锚定）
-    nonisolated(unsafe) public static var softwareClockIgnoresEarlyFirstSample = false
+    /// [MovieClaw P13] Upstream adopted this rule in 7.32.2 (AE#724): only a first sample ahead of the
+    /// start re-anchors the clock. Kept as a no-op so hosts that still set it compile.
+    @available(*, deprecated, message: "Always on since upstream 7.32.2 (AE#724).")
+    nonisolated(unsafe) public static var softwareClockIgnoresEarlyFirstSample = true
 }

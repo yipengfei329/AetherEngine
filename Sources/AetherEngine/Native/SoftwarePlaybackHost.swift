@@ -369,7 +369,7 @@ final class SoftwarePlaybackHost {
     /// It reads the SOURCE axis, the same axis as `SoftwareVideoFrameTime.presentation` and as the
     /// subtitle cues, so an overlay paced against it needs no conversion.
     var presentationTimebase: CMTimebase? {
-        audioOutput?.synchronizer.timebase
+        audioOutput?.sourceTimebase
     }
 
     /// #311: forwarded to the renderer, which is where a frame is actually handed over. Set through
@@ -1083,7 +1083,9 @@ final class SoftwarePlaybackHost {
         self.splitDisplaySetSubtitleStreamIndices = dem.splitDisplaySetSubtitleStreamIndices()
 
         // AudioOutput owns the AVSampleBufferRenderSynchronizer (master clock). Created unconditionally: video-only previously got no clock (frozen frame, currentTime=0). Layer attached in play() after the engine hangs it in the view hierarchy (attaching free-floating fails FigVideoQueueRemote -12080 on tvOS 26+).
-        self.audioOutput = AudioOutput()
+        let audioOutput = AudioOutput()
+        self.audioOutput = audioOutput
+        renderer.setTimeline(audioOutput.timeline)   // AE#395
         self.audioOutput?.volume = volume
         self.audioOutput?.setPresentationOffset(seconds: audioDelaySeconds)   // AE#464
         // AE#395: the route this session plays into, the counterpart of the native host's line. Without
@@ -1106,7 +1108,10 @@ final class SoftwarePlaybackHost {
         }
 
         if let start = startPosition, start.isFinite, start > 0 {
-            let sourceStart = start + presetZero
+            // AE#724: the anchor is a session-axis position; on an offset-origin source it is carried
+            // over before it reaches the demuxer, the skip threshold and the clock, as a seek's is.
+            // [MovieClaw P35] The zero is the one preset above for every VOD load.
+            let sourceStart = SWClockAnchorPolicy.sourceSeconds(forSession: start, sessionZeroSeconds: presetZero)
             // #254: same off-main, deadline-bounded reposition the transport seek uses. A resume into a
             // remote source that has to scan for its landing would otherwise block the main thread here.
             _ = await dem.seekBounded(to: sourceStart, timeout: Self.seekBudgetSeconds, on: seekQueue)
@@ -1120,6 +1125,7 @@ final class SoftwarePlaybackHost {
             renderer.setSkipThreshold(startTime)
             initialClockTime = startTime
             currentTime = start
+            sourceClockSeconds = sourceStart
         } else {
             initialClockTime = presetZero > 0 ? CMTime(seconds: presetZero, preferredTimescale: 90000) : .zero
         }
@@ -1966,7 +1972,7 @@ final class SoftwarePlaybackHost {
             self?.backgroundAudioOnly ?? false
         }
         // #107: the demux loop reports the resolved session-zero offset when it re-anchors
-        // the clock at a deviating first-sample PTS (mid-stream-joined source).
+        // the clock at a first-sample PTS far past the anchor (mid-stream-joined source).
         let onClockAnchored: @Sendable (Double) -> Void = { [weak self] zero in
             guard let self else { return }
             // [MovieClaw P35] 锚点已含预设的起点，重锚得出的偏差叠在它上面
@@ -3231,7 +3237,7 @@ final class SoftwarePlaybackHost {
                 }
                 // Arm clock on first decoded audio buffer; latch so subsequent packets don't snap clock back.
                 if !clockArmed(), !buffers.isEmpty {
-                    // #107: anchor at the buffer PTS when it deviates from the load anchor
+                    // #107: anchor at the buffer PTS when it lies far past the load anchor
                     // (mid-stream-joined source); aligned sources keep the anchor verbatim.
                     let firstPts = CMSampleBufferGetPresentationTimeStamp(buffers[0])
                     let resolution = SWClockAnchorPolicy.resolve(
@@ -3292,6 +3298,9 @@ final class SoftwarePlaybackHost {
                 guard !self.seekInFlight else { return }
                 let raw = aOut.currentTimeSeconds
                 self.emitDiagIfDue(clock: raw)
+                // AE#724: until the first sample arms it, the synchronizer still reads 0, and a paused
+                // resume would publish that over the anchor load() set.
+                if !self.isLive, !self.clockArmed { return }
                 if raw.isFinite, raw >= 0 {
                     self.vodPacketReadAhead?.updatePlayhead(raw)
                     // Raw clock = source/subtitle axis; published alongside the mapped position (#107).

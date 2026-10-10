@@ -13,6 +13,19 @@ The English host API contract is in [docs/api.md](docs/api.md).
 - Full `swift test --jobs 4` is **not green**: the engine XCTest run executed 718 tests (one skipped, one failure), and Swift Testing executed 4,129 tests across 570 suites with 41 issues. These failures include downstream/upstream assumptions about target segment length, keyframe-index trust, SDR transfer labels, initial range size, held-reader/backpressure behavior, source-probe input limits, and the `LoadOptions` inventory. The known APFS allocation-sensitive cache-trim test also fails, as in the original MovieClaw fork. These checks are retained for upstream reconciliation.
 - The app build and real-media results below were measured against the same downstream engine source in MovieClaw. This contribution is a draft for review of the complete extension set, rather than a merge-ready declaration that the upstream suite has passed.
 
+## Upstream 7.33.2 (2026-10-11)
+
+- Merged upstream 7.33.2. Upstream AE#724 (7.32.2) took P13's software-clock rule as its default (only a
+  first sample ahead of the start re-anchors) and the resume half of P35 (`resumeSessionZero`). The P13
+  switch `softwareClockIgnoresEarlyFirstSample` is now a deprecated no-op; P35 keeps only what upstream
+  does not do, presetting the origin for a VOD load that starts from the head, on top of
+  `resumeSessionZero`.
+- Full `swift test --jobs 8`: 4,252 Swift Testing cases in 588 suites and the XCTest suite; three
+  issues, none from the merge. `ItemSwapStillTests` "a playing native item hands over the frame on
+  screen" fails identically on pristine upstream 7.33.2 on this machine (macOS 27.0.1); the
+  `HLSPlaylistHostileInputTests` linear-time bound and `Issue684PumpJoinSpentTests` pass when rerun
+  alone (timing under a full parallel run).
+
 ## Upstream 7.32.0 (2026-10-08)
 
 - Merged upstream 7.32.0. P19 (#719), P8 (#720) and P57 (#721) were taken upstream and now use
