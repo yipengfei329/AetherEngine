@@ -10,7 +10,15 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **A Blu-ray ripped as a `BDMV` folder plays over HTTP.** A host hands the folder to `load(source: .custom(reader))`
+  as a `DiscDirectoryReader`, or as the ready-made `HTTPDiscDirectoryReader` with one URL per file, and
+  the engine recognizes it the way it recognizes a Blu-ray ISO: the same bounded playlist scan and title
+  selection, the selected title's clips concatenated in playlist order, and the same multi-clip timeline,
+  chapters and track languages. The origin serves plain files over `Range` and never remuxes the disc. An
+  optional `preferredPlaylist` names the main title, so only that playlist is read. A controlled probe
+  (`limits` or `cancellation`) does not recognize a folder yet.
 
 ## [7.33.2] - 2026-10-09
 
