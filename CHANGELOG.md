@@ -20,6 +20,17 @@ the public-API contract.
   optional `preferredPlaylist` names the main title, so only that playlist is read. A controlled probe
   (`limits` or `cancellation`) does not recognize a folder yet.
 
+### Fixed
+
+- **A disc title whose clips restart their clock declares a bandwidth AVPlayer can choose.** libavformat
+  divides the source size by the duration it reads off the timestamps, which over such a title is as
+  wrong as the duration itself (AE#105). A 6537 s UHD title whose two clips both start at 11.6 s probed
+  as 388 s and declared `BANDWIDTH=2253434656`; AVPlayer never picked the variant and waited with no
+  item to play. Whenever libavformat produces a rate for a disc title, the rate is now the title's size
+  over its playlist duration (66.9 Mbit/s for that title, which then started playing). A title
+  libavformat gives no rate for, which is what a remote ISO opened by URL gets, keeps the over-declared
+  fallback as before.
+
 ## [7.33.2] - 2026-10-09
 
 ### Fixed

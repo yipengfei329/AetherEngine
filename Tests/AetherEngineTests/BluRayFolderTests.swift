@@ -175,6 +175,24 @@ struct BluRayFolderTests {
         #expect(try DiscReader.wrap(MemoryFolder([("BDMV/index.bdmv", Data([1]))])) == nil)
     }
 
+    @Test("a title whose clips restart their clock declares its rate over the playlist duration")
+    func bitRateOverThePlaylistDuration() throws {
+        // Two clips that both start at 1.4 s: libavformat reads the concatenation as about 8 s long and
+        // divides the whole size by that, twice the real rate of the 16 s title.
+        let stream = TinyTransportStreamFixture.data
+        let folder = MemoryFolder([
+            ("BDMV/PLAYLIST/00001.mpls", Self.mpls([(id: "00001", inT: 63000, outT: 423000),
+                                                    (id: "00002", inT: 63000, outT: 423000)])),
+            ("BDMV/STREAM/00001.m2ts", stream),
+            ("BDMV/STREAM/00002.m2ts", stream),
+        ])
+        let demuxer = Demuxer()
+        try demuxer.open(reader: folder)
+        defer { demuxer.close() }
+        let expected = Double(stream.count * 2) * 8 / 16
+        #expect(abs(Double(demuxer.bitRate) - expected) / expected < 0.01)
+    }
+
     // MARK: - The concatenating reader
 
     /// A file reader that counts its bytes as if they came from an origin, and whether it was closed.
