@@ -12,9 +12,13 @@ struct DiscRecognition: Sendable {
     /// Per-clip presentation-offset spans for the selected multi-clip Blu-ray title; empty otherwise.
     /// Cached so a re-open (subtitle side demuxer, reload) rebuilds the same normalized timeline (AE#105).
     let clipTimeline: [ClipSpan]
+    /// The selected DVD title's time map, cached so a re-open seeks the same way.
+    let dvdTimeMap: DVDTimeMap?
 
     init(formatHint: String, titles: [DiscTitle], selectedTitleIndex: Int,
-         extents: [(offset: Int64, length: Int64)], clipTimeline: [ClipSpan] = []) {
+         extents: [(offset: Int64, length: Int64)], clipTimeline: [ClipSpan] = [],
+         dvdTimeMap: DVDTimeMap? = nil) {
+        self.dvdTimeMap = dvdTimeMap
         self.formatHint = formatHint
         self.titles = titles
         self.selectedTitleIndex = selectedTitleIndex
