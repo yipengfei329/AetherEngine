@@ -505,12 +505,6 @@ public final class Demuxer: @unchecked Sendable {
     /// non-empty, `readPacket` and `indexedKeyframes` fold each clip's timestamps onto one contiguous
     /// timeline so the playhead does not leap at clip boundaries (AE#105). Guarded by `accessLock`.
     private var clipTimeline: [ClipSpan] = []
-    /// [MovieClaw P7] 选中蓝光标题的 CLPI 定位表：有它就按 EP map 按字节定位，不再按时间二分
-    private var discSeekTable: DiscSeekTable?
-    /// [MovieClaw P13] 选中 DVD 标题按 cell 折叠：cell 的时间戳基准从导航包算（见 `adoptDVDNav`）
-    private var dvdCellFold = false
-    /// [MovieClaw P13] 选中 DVD 标题的时间表：有它就「标题时间 → VOBU 字节偏移」一次定位
-    private var dvdTimeMap: DVDTimeMap?
     /// [MovieClaw P18] 没有可用 Cues 的 MKV（文件头判定，见 `MatroskaCuesProbe`）：引擎起播前不做索引预热，
     /// 按时间定位前先按字节探一个 Cluster 登记成索引项（`assistIndexlessMatroskaSeek`）
     private(set) var indexlessMatroska = false
@@ -533,6 +527,9 @@ public final class Demuxer: @unchecked Sendable {
     /// A clip's observed base is only trusted on a clean forward crossing (`idx == lastReadClipIdx + 1`),
     /// so a seek landing mid-clip cannot mis-anchor that clip's fold offset. AE#105.
     private var lastReadClipIdx: Int = -1
+    /// The selected Blu-ray title's EP-map seek table, when every clip has one: a seek then goes to the
+    /// keyframe's byte instead of searching by timestamp (`seekByDiscTableLocked`). Under `accessLock`.
+    private var discSeekTable: DiscSeekTable?
     /// Observed raw STC base (seconds) of clip 0's first read packet. The fold anchors every clip to this so
     /// the folded timeline stays in clip 0's raw domain (the producer gate then zero-bases it). NaN until the
     /// first packet is read. Guarded by `accessLock`. AE#105.
@@ -541,6 +538,11 @@ public final class Demuxer: @unchecked Sendable {
     /// the first time it is read and cached (stable across seeks). NaN = not yet resolved. Guarded by
     /// `accessLock`. AE#105.
     private var clipResolvedShiftSec: [Double] = []
+    /// The selected DVD title is folded by cell (`DiscReader.dvdCellTimeline`): each cell's timestamp base
+    /// comes from its navigation packs (`adoptDVDNav`). Under `accessLock`.
+    private var dvdCellFold = false
+    /// The selected DVD title's time map: a seek goes to the VOBU's byte (`seekByDVDTimeMapLocked`).
+    private var dvdTimeMap: DVDTimeMap?
     /// AE#105 diag: last clip index we logged a boundary crossing for, and the last folded PTS
     /// (seconds) seen, so a crossing can print the true raw jump against the applied offset.
     private var diagLastLoggedClipIndex: Int = -1
@@ -1115,8 +1117,8 @@ public final class Demuxer: @unchecked Sendable {
         logStreams(ctx)
         pairDolbyVisionDualPID(ctx)  // [MovieClaw P9]
         detectIndexlessMatroska(ctx)  // [MovieClaw P18]
-        // [MovieClaw P13] DVD 按 cell 折叠：cell 0 的时间戳基准就是流的起始时间（引擎的源时间轴也以它为原点），
-        // 续播直接落在后面的 cell 时也有基准可折
+        // A cell-folded DVD title is anchored on cell 0's base, which is where the stream starts (the
+        // engine's source axis starts there too), so a resume that lands in a later cell can fold at once.
         if dvdCellFold, clipBase0Sec.isNaN, ctx.pointee.start_time != Int64.min {
             clipBase0Sec = Double(ctx.pointee.start_time) / Double(AV_TIME_BASE)
         }
@@ -1359,9 +1361,23 @@ public final class Demuxer: @unchecked Sendable {
 
     /// AVFormatContext.bit_rate in bps, or 0 if unknown. Used by
     /// HLSVideoEngine.masterBandwidth to populate HLS BANDWIDTH attributes.
+    ///
+    /// A disc title takes its rate from its own size over its playlist duration instead, whenever
+    /// libavformat produced one. libavformat divides the source size by the duration it read off the
+    /// timestamps, and that duration is as unreliable over a multi-clip title whose clips restart their
+    /// clock as it is for `duration` (AE#105): a 6537 s title whose two clips both start at 11.6 s probed
+    /// as 388 s, and its 54.6 GB declared 1.1 Gbit/s on average and 2.25 Gbit/s at peak, a variant no
+    /// AVPlayer ever chose (it waited with no item to play). A title libavformat gives no rate for keeps
+    /// the 0 and the caller's over-declared fallback.
     var bitRate: Int64 {
         guard let ctx = formatContext else { return 0 }
-        return ctx.pointee.bit_rate
+        let declared = ctx.pointee.bit_rate
+        guard declared > 0, let titleSeconds = selectedDiscTitleDurationSeconds, let pb = ctx.pointee.pb else {
+            return declared
+        }
+        let size = avio_size(pb)
+        guard size > 0 else { return declared }
+        return Int64((Double(size) * 8 / titleSeconds).rounded())
     }
 
     /// [MovieClaw P37] 平均码率：容器声明了就用它，没声明（原盘 / 光盘镜像的 MPEG-TS 时长是 NOPTS、bit_rate 为 0）
@@ -1951,7 +1967,8 @@ public final class Demuxer: @unchecked Sendable {
                 // [MovieClaw P9] 增强层要读：它的 RPU 挂到基础层上
                 stream.pointee.discard = AVDISCARD_DEFAULT
             } else if dvdCellFold, stream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_DVD_NAV {
-                // [MovieClaw P13] DVD 导航包要读：cell 的时间戳基准从它算，读完即丢、不往下游送
+                // A cell-folded DVD title reads its navigation packs for the cell bases; `readPacketLocked`
+                // absorbs them, so they never reach a caller.
                 stream.pointee.discard = AVDISCARD_DEFAULT
             } else if i == pacing {
                 stream.pointee.discard = AVDISCARD_NONKEY
@@ -2158,7 +2175,7 @@ public final class Demuxer: @unchecked Sendable {
                 return nil
             }
             if dvEnhancementStream >= 0, !dvMergeDualLayer(read) { continue }  // [MovieClaw P9]
-            if dvdCellFold, adoptDVDNav(read) {  // [MovieClaw P13]
+            if dvdCellFold, adoptDVDNav(read) {
                 var owned: UnsafeMutablePointer<AVPacket>? = read
                 trackedPacketFree(&owned)
                 continue
@@ -2359,19 +2376,8 @@ public final class Demuxer: @unchecked Sendable {
         // seekable by design, so live callers keep their own rules.
         guard isSourceSeekable else { return false }
         dropPeekedPacketsLocked()
-        // [MovieClaw P7] 蓝光有 CLPI：按折叠后的时间找剪辑、查 EP map 得到关键帧的字节偏移，按字节一次到位。
-        // 时间二分在各剪辑时间戳互相重叠时会落到别的剪辑里，经 HTTP 读机械盘时每一步还是一次请求加一次寻道
-        if let table = discSeekTable,
-           let hit = table.keyframe(forSourceSeconds: seconds, base0Sec: clipBase0Sec),
-           avformat_seek_file(ctx, -1, hit.offset, hit.offset, hit.offset, AVSEEK_FLAG_BYTE) >= 0 {
-            EngineLog.emit("[Demuxer] [MovieClaw P7] EP map seek: source=\(String(format: "%.3f", seconds))s → clip \(hit.clip) keyframe raw=\(String(format: "%.3f", hit.keyframeSec))s byte=\(hit.offset)", category: .demux)
-            avformat_flush(ctx)
-            resetSubpictureAssembly()
-            lastReadClipIdx = -1  // AE#105：落在剪辑中间，别把它当成顺序跨入
-            return true
-        }
-        // [MovieClaw P13] DVD 有时间表：标题时间 → VOBU 字节偏移。cell 之间 PTS 归零时按时间二分找不到落点
-        if dvdSeekByTimeMap(ctx, sourceSeconds: seconds) { return true }
+        if seekByDiscTableLocked(ctx, sourceSeconds: seconds) { return true }
+        if seekByDVDTimeMapLocked(ctx, sourceSeconds: seconds) { return true }
         assistIndexlessMatroskaSeek(ctx, targetSeconds: seconds)  // [MovieClaw P18]
         let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
         if ret < 0 {
@@ -2411,11 +2417,9 @@ public final class Demuxer: @unchecked Sendable {
         }
         guard isSourceSeekable else { return false }  // audit HLS-103, see `seek(to:)`
         dropPeekedPacketsLocked()
-        // [MovieClaw P13] 同上：DVD 按时间表定位（时间戳是折叠后的源时间轴）
-        if dvdTimeMap != nil, let stream = ctx.pointee.streams[Int(streamIndex)],
-           stream.pointee.time_base.num > 0, stream.pointee.time_base.den > 0,
-           dvdSeekByTimeMap(ctx, sourceSeconds: Double(timestamp) * Double(stream.pointee.time_base.num)
-                                / Double(stream.pointee.time_base.den)) {
+        if dvdTimeMap != nil, let timeBase = ctx.pointee.streams[Int(streamIndex)]?.pointee.time_base,
+           timeBase.num > 0, timeBase.den > 0,
+           seekByDVDTimeMapLocked(ctx, sourceSeconds: Double(timestamp) * Double(timeBase.num) / Double(timeBase.den)) {
             return true
         }
         // [MovieClaw P18] 没有 Cues 的 MKV：先按字节探一个目标前的 Cluster 登记成索引项
@@ -2568,9 +2572,9 @@ public final class Demuxer: @unchecked Sendable {
         // seek on a remote ISO sat wedged ~230 s and every later re-arm queued behind it.
         avioProvider?.beginReadDeadline(secondsFromNow: timeout)
         defer { avioProvider?.endReadDeadline() }
-        // [MovieClaw P7 / P13] 光盘有定位表就按字节一次到位（同 `seek(to:)`）：软件通路（VC-1 原盘、DVD 的 MPEG-2）
-        // 与字幕旁路都走这里，原来绕过了定位表、在 PTS 归零或互相重叠的剪辑里按时间二分
-        if discTableSeek(ctx, sourceSeconds: seconds) {
+        // The software path and the subtitle side reader reposition here, so a disc title seeks by its
+        // EP maps or its DVD time map here too, whichever stream anchors the request.
+        if seekByDiscTableLocked(ctx, sourceSeconds: seconds) || seekByDVDTimeMapLocked(ctx, sourceSeconds: seconds) {
             return !(avioProvider?.readDeadlineFired ?? false) && probeControl?.isStopped != true
         }
         assistIndexlessMatroskaSeek(ctx, targetSeconds: seconds)  // [MovieClaw P18]
@@ -2763,6 +2767,85 @@ public final class Demuxer: @unchecked Sendable {
         return Self.sourceStartOrigin(
             formatStartUs: ctx.pointee.start_time, videoStreamStart: videoStart,
             videoTimeBaseNum: tbNum, videoTimeBaseDen: tbDen)
+    }
+
+    /// Repositions a Blu-ray title to the keyframe at or before `seconds` (the folded source axis) by its
+    /// clips' EP maps, in one byte seek. A timestamp search over a title whose clips each run their own
+    /// clock from the same start cannot tell the clips apart: a 3000 s seek on a two-clip title whose
+    /// clips both start at 11.6 s landed in the second clip, four packets before its end. Returns false,
+    /// with nothing moved, when the title has no table; the caller searches by timestamp then. Caller
+    /// holds `accessLock`.
+    private func seekByDiscTableLocked(_ ctx: UnsafeMutablePointer<AVFormatContext>, sourceSeconds seconds: Double) -> Bool {
+        guard let table = discSeekTable,
+              let hit = table.keyframe(forSourceSeconds: seconds, base0Sec: clipBase0Sec),
+              avformat_seek_file(ctx, -1, hit.offset, hit.offset, hit.offset, AVSEEK_FLAG_BYTE) >= 0 else { return false }
+        EngineLog.emit("[Demuxer] EP map seek: source=\(String(format: "%.3f", seconds))s -> clip \(hit.clip) keyframe "
+                       + "\(String(format: "%.3f", hit.keyframeSec))s on its clock, byte \(hit.offset)", category: .demux)
+        avformat_flush(ctx)
+        resetSubpictureAssembly()  // #651
+        lastReadClipIdx = -1  // AE#105: a landing mid-clip is not a clean crossing
+        return true
+    }
+
+    /// Repositions a DVD title to the VOBU at or before `seconds` (the folded source axis: cell 0's base
+    /// plus title time) by its time map, in one byte seek. Over a title whose cells restart their
+    /// timestamps, a timestamp search lands nowhere near: a 2000 s seek read straight to the end of the
+    /// title and the session ended. Returns false, with nothing moved, without a time map or before cell 0's
+    /// base is known; the caller searches by timestamp then. Caller holds `accessLock`.
+    private func seekByDVDTimeMapLocked(_ ctx: UnsafeMutablePointer<AVFormatContext>, sourceSeconds seconds: Double) -> Bool {
+        guard let map = dvdTimeMap, clipBase0Sec.isFinite else { return false }
+        let titleSeconds = max(0, seconds - clipBase0Sec)
+        let offset = map.byteOffset(forTitleSeconds: titleSeconds)
+        guard avformat_seek_file(ctx, -1, offset, offset, offset, AVSEEK_FLAG_BYTE) >= 0 else { return false }
+        EngineLog.emit("[Demuxer] DVD time map seek: title=\(String(format: "%.3f", titleSeconds))s -> byte \(offset)",
+                       category: .demux)
+        avformat_flush(ctx)
+        resetSubpictureAssembly()  // #651
+        lastReadClipIdx = -1  // landing mid-cell; its offset comes from the next navigation pack
+        return true
+    }
+
+    /// Absorbs a DVD navigation pack, recording the timestamp base of the cell it is in; true when the
+    /// packet was one (the caller drops it). A navigation pack leads every VOBU, so a cell entered in
+    /// order and a seek landing mid-cell both meet it before that cell's audio and video, and the cell's
+    /// offset is in place before its first packet is folded. Caller holds `accessLock`.
+    private func adoptDVDNav(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
+        guard let ctx = formatContext,
+              let stream = ctx.pointee.streams[Int(packet.pointee.stream_index)],
+              stream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_DVD_NAV else { return false }
+        guard let data = packet.pointee.data, packet.pointee.size > 0,
+              let cellBase = Self.dvdCellBaseSeconds(pci: UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
+        else { return true }
+        let idx = ClipSpan.index(forPos: packet.pointee.pos, in: clipTimeline, fallback: lastClipIndex)
+        if idx == 0 {
+            if clipBase0Sec.isNaN { clipBase0Sec = cellBase }
+            return true
+        }
+        guard clipBase0Sec.isFinite, idx < clipResolvedShiftSec.count else { return true }
+        let shift = ClipFold.offsetSeconds(observedBaseSec: cellBase, base0Sec: clipBase0Sec,
+                                           cumulativeBeforeSec: clipTimeline[idx].cumulativeBeforeSec)
+        if !clipResolvedShiftSec[idx].isFinite || abs(clipResolvedShiftSec[idx] - shift) > 0.05 {
+            clipResolvedShiftSec[idx] = shift
+            EngineLog.emit("[Demuxer] DVD cell \(idx): base=\(String(format: "%.3f", cellBase))s "
+                           + "cumBefore=\(String(format: "%.1f", clipTimeline[idx].cumulativeBeforeSec))s -> shift "
+                           + "\(String(format: "%.3f", shift))s", category: .demux)
+        }
+        return true
+    }
+
+    /// The raw timestamp (seconds) at which the cell a navigation pack's PCI belongs to starts: the
+    /// VOBU's start PTS (90 kHz) less the cell's elapsed time (C_ELTM, BCD with a frame count). nil for a
+    /// DSI or a PCI too short to read; libavformat hands the two over as separate packets, the PCI's
+    /// first byte 0x00, the DSI's 0x01.
+    static func dvdCellBaseSeconds(pci data: UnsafeBufferPointer<UInt8>) -> Double? {
+        guard data.count >= 0x1D, data[0] == 0x00 else { return nil }
+        let startPTS = (UInt32(data[0x0D]) << 24) | (UInt32(data[0x0E]) << 16) | (UInt32(data[0x0F]) << 8) | UInt32(data[0x10])
+        func bcd(_ b: UInt8) -> Double { Double(Int(b >> 4) * 10 + Int(b & 0x0F)) }
+        let frameByte = data[0x1C]
+        let fps: Double = (frameByte >> 6) == 1 ? 25 : ((frameByte >> 6) == 3 ? 30000.0 / 1001.0 : 0)
+        let elapsed = bcd(data[0x19]) * 3600 + bcd(data[0x1A]) * 60 + bcd(data[0x1B])
+            + (fps > 0 ? bcd(frameByte & 0x3F) / fps : 0)
+        return Double(startPTS) / 90000 - elapsed
     }
 
     /// One AVSEEK_FLAG_BYTE positioning seek + flush. Shared by the estimate probe loop.
@@ -3167,43 +3250,8 @@ extension Demuxer {
 }
 
 
-// MARK: - [MovieClaw P13] DVD 按 cell 折叠时间轴、按时间表定位（仓库 docs/design/disc-direct-play.md）
+// MARK: - [MovieClaw P18] 没有可用 Cues 的 MKV
 extension Demuxer {
-    /// 导航包（MPEG-PS 私有流 2 里的 PCI）：记下它所在 cell 的时间戳基准，返回 true 表示这是导航包、已吸收。
-    /// PCI 里 VOBU 起始 PTS（90 kHz）减去 cell 内已播时间（C_ELTM）就是这个 cell 开头的原始时间戳，
-    /// 折叠偏移 = 基准 − cell 0 的基准 − 标题时间轴上这个 cell 之前的总时长。导航包在每个 VOBU 的最前面，
-    /// 顺序跨入新 cell、跳转落在 cell 中间，都是先读到它、再读到这个 cell 的音视频包，偏移总赶在前面
-    fileprivate func adoptDVDNav(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
-        guard let ctx = formatContext,
-              let stream = ctx.pointee.streams[Int(packet.pointee.stream_index)],
-              stream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_DVD_NAV else { return false }
-        // libavformat 按子流拆成两种包：PCI（首字节 0x00，980 字节）与 DSI（0x01），只用 PCI
-        guard let data = packet.pointee.data, packet.pointee.size >= 0x1D, data[0] == 0x00 else { return true }
-        let startPTS = (UInt32(data[0x0D]) << 24) | (UInt32(data[0x0E]) << 16) | (UInt32(data[0x0F]) << 8) | UInt32(data[0x10])
-        func bcd(_ b: UInt8) -> Double { Double(Int(b >> 4) * 10 + Int(b & 0x0F)) }
-        let frameByte = data[0x1C]
-        let fps: Double = (frameByte >> 6) == 1 ? 25 : ((frameByte >> 6) == 3 ? 30000.0 / 1001.0 : 0)
-        let elapsed = bcd(data[0x19]) * 3600 + bcd(data[0x1A]) * 60 + bcd(data[0x1B])
-            + (fps > 0 ? bcd(frameByte & 0x3F) / fps : 0)
-        let cellBase = Double(startPTS) / 90000 - elapsed
-        let idx = ClipSpan.index(forPos: packet.pointee.pos, in: clipTimeline, fallback: lastClipIndex)
-        if idx == 0 {
-            if clipBase0Sec.isNaN { clipBase0Sec = cellBase }
-            return true
-        }
-        guard clipBase0Sec.isFinite, idx < clipResolvedShiftSec.count else { return true }
-        let shift = ClipFold.offsetSeconds(observedBaseSec: cellBase, base0Sec: clipBase0Sec,
-                                           cumulativeBeforeSec: clipTimeline[idx].cumulativeBeforeSec)
-        if !clipResolvedShiftSec[idx].isFinite || abs(clipResolvedShiftSec[idx] - shift) > 0.05 {
-            clipResolvedShiftSec[idx] = shift
-            EngineLog.emit("[Demuxer] [MovieClaw P13] DVD cell \(idx): base=\(String(format: "%.3f", cellBase))s "
-                           + "cumBefore=\(String(format: "%.1f", clipTimeline[idx].cumulativeBeforeSec))s → shift \(String(format: "%.3f", shift))s",
-                           category: .demux)
-        }
-        return true
-    }
-
-    /// 光盘的定位表（蓝光 CLPI 的 EP map、DVD 的时间表）按字节一次到位；都没有、或按字节定位失败时返回 false。调用方持有 accessLock
     /// [MovieClaw P18] 读文件头判断 MKV 有没有可用的 Cues（`MatroskaCuesProbe.headInfo`）。只在可随机读、知道总长的
     /// matroska 源上做；文件头读取器本来就留着，不多发请求。读完把读位置放回原处，libavformat 接着读不受影响。
     private func detectIndexlessMatroska(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
@@ -3327,31 +3375,4 @@ extension Demuxer {
         return nil
     }
 
-    fileprivate func discTableSeek(_ ctx: UnsafeMutablePointer<AVFormatContext>, sourceSeconds seconds: Double) -> Bool {
-        if let table = discSeekTable,
-           let hit = table.keyframe(forSourceSeconds: seconds, base0Sec: clipBase0Sec),
-           avformat_seek_file(ctx, -1, hit.offset, hit.offset, hit.offset, AVSEEK_FLAG_BYTE) >= 0 {
-            EngineLog.emit("[Demuxer] [MovieClaw P7] EP map seek: source=\(String(format: "%.3f", seconds))s → clip \(hit.clip) keyframe raw=\(String(format: "%.3f", hit.keyframeSec))s byte=\(hit.offset)", category: .demux)
-            avformat_flush(ctx)
-            resetSubpictureAssembly()
-            lastReadClipIdx = -1
-            return true
-        }
-        return dvdSeekByTimeMap(ctx, sourceSeconds: seconds)
-    }
-
-    /// 按时间表定位：源时间（cell 0 的时间戳基准 + 标题时间）→ 标题时间 → 不晚于它的 VOBU 的字节偏移，按字节一次到位。
-    /// 没有时间表、还不知道 cell 0 的基准、或按字节定位失败时返回 false（调用方退回原来的按时间定位）。调用方持有 accessLock
-    fileprivate func dvdSeekByTimeMap(_ ctx: UnsafeMutablePointer<AVFormatContext>, sourceSeconds seconds: Double) -> Bool {
-        guard let map = dvdTimeMap, clipBase0Sec.isFinite else { return false }
-        let titleSeconds = max(0, seconds - clipBase0Sec)
-        let offset = map.byteOffset(forTitleSeconds: titleSeconds)
-        guard avformat_seek_file(ctx, -1, offset, offset, offset, AVSEEK_FLAG_BYTE) >= 0 else { return false }
-        EngineLog.emit("[Demuxer] [MovieClaw P13] DVD time map seek: title=\(String(format: "%.3f", titleSeconds))s → byte \(offset)",
-                       category: .demux)
-        avformat_flush(ctx)
-        resetSubpictureAssembly()
-        lastReadClipIdx = -1  // 落在 cell 中间，偏移等导航包来算
-        return true
-    }
 }

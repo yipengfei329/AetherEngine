@@ -1,29 +1,25 @@
 import Foundation
 
-// [MovieClaw P7] 原盘按 CLPI 的 EP map 定位（仓库 docs/design/disc-direct-play.md）。
-//
-// 引擎原本对原盘源按时间二分查找（avformat_seek_file）。多剪辑主片的各剪辑时间戳常常各自从头开始、
-// 互相重叠（《完美陌生人》两段都从约 600 秒起），二分会落到别的剪辑里，跳转一直落不了地；经 HTTP 读
-// NAS 机械盘时，二分的每一步都是一次请求加一次随机寻道，续播起播要十几秒（《不一样的天空》14.8 秒）。
-// 蓝光每个剪辑自带 CLPI，里面的 EP map 就是「关键帧 PTS → 源包号」的对照表：按折叠后的时间找到剪辑、
-// 换成剪辑内的原始 PTS、查表得到字节偏移，一次按字节定位就到。
-
-/// CLPI 的 EP map 入口：关键帧的原始 PTS（45 kHz）与源包号（每个源包 192 字节）
+/// One entry point of a Blu-ray clip's EP map: a video keyframe's presentation time on the clip's own
+/// clock (45 kHz) and the source packet it starts at (192 bytes each in an `.m2ts`).
 struct CLPIEntryPoint: Sendable, Equatable {
     let pts45k: UInt64
     let spn: UInt32
 }
 
+/// Reads the EP map out of a clip information file (`BDMV/CLIPINF/NNNNN.clpi`).
 enum CLPIParser {
-    /// 主视频 PID；杜比视界双层原盘的增强层在另一个 PID，定位只看主视频
+    /// The primary video PID. A dual-layer Dolby Vision clip maps its enhancement layer on another PID;
+    /// seeking only needs the base layer's keyframes.
     static let primaryVideoPID = 0x1011
 
-    /// 解析 CPI/EP_map，返回主视频流的入口（按 PTS 升序）。位域与 libbluray 的 `clpi_access_point`
-    /// 一致（也与服务端 bluray.parse_clpi_keyframes 同一套）：
-    /// 粗表 8 字节 = ref_to_EP_fine_id 18 位 · PTS_EP_coarse 14 位 · SPN_EP_coarse 32 位；
-    /// 细表 4 字节 = 角度标志 1 位 · I 帧尾偏移 3 位 · PTS_EP_fine 11 位 · SPN_EP_fine 17 位。
-    /// 完整 PTS（45 kHz）= ((粗 & ~1) << 18) + (细 << 8)；完整 SPN = (粗 & ~0x1FFFF) + 细。
-    /// 畸形数据返回空表（调用方退回时间二分）。
+    /// The primary video stream's entry points, ascending by time, or empty when the file is not a
+    /// readable CLPI (the caller keeps seeking by timestamp then).
+    ///
+    /// Field layout as in libbluray's `clpi_access_point`: a coarse entry is 8 bytes
+    /// (ref_to_EP_fine_id 18 bits, PTS_EP_coarse 14, SPN_EP_coarse 32), a fine entry 4 bytes
+    /// (angle change 1 bit, I-end offset 3, PTS_EP_fine 11, SPN_EP_fine 17). The full time (45 kHz) is
+    /// `((coarse & ~1) << 18) + (fine << 8)`, the full packet number `(coarse & ~0x1FFFF) + fine`.
     static func entryPoints(_ data: [UInt8]) -> [CLPIEntryPoint] {
         func be16(_ at: Int) -> Int { (Int(data[at]) << 8) | Int(data[at + 1]) }
         func be32(_ at: Int) -> UInt32 {
@@ -35,7 +31,7 @@ enum CLPIParser {
         let cpiLength = Int(be32(cpiOffset))
         let cpiEnd = cpiOffset + 4 + cpiLength
         guard cpiLength > 0, cpiEnd <= data.count else { return [] }
-        // 2 字节：12 位保留 + 4 位 cpi_type；EP_map 内的相对地址以其后为基准
+        // 12 reserved bits and the 4-bit CPI type; the EP map's own addresses count from after them.
         let epMapPos = cpiOffset + 4 + 2
         guard epMapPos + 2 <= cpiEnd else { return [] }
         let streamCount = Int(data[epMapPos + 1])
@@ -43,9 +39,10 @@ enum CLPIParser {
         var chosen: (pid: Int, coarse: Int, fine: Int, start: Int)?
         for _ in 0..<streamCount {
             guard pos + 12 <= cpiEnd else { return [] }
-            // 12 字节：PID 16 · 保留 10 · 流类型 4 · 粗表数 16 · 细表数 18 · 流表起址 32
+            // PID 16 bits, then 64 bits of reserved 10, stream type 4, coarse count 16, fine count 18
+            // and the upper 16 bits of the stream table's start address, then its lower 16 bits.
             let pid = be16(pos)
-            let packed = (UInt64(be32(pos + 2)) << 32) | UInt64(be32(pos + 6))  // 64 位里是：保留 10 · 类型 4 · 粗 16 · 细 18 · 起址高 16
+            let packed = (UInt64(be32(pos + 2)) << 32) | UInt64(be32(pos + 6))
             let coarseCount = Int((packed >> 34) & 0xFFFF)
             let fineCount = Int((packed >> 16) & 0x3FFFF)
             let start = Int((UInt32(truncatingIfNeeded: packed & 0xFFFF) << 16) | UInt32(be16(pos + 10)))
@@ -86,22 +83,30 @@ enum CLPIParser {
     }
 }
 
-/// 选中标题的原盘定位表：每个剪辑在拼接流里的起点、在标题时间轴上的起点、MPLS in_time 与 EP map
+/// Where each keyframe of the selected Blu-ray title is, by its clips' EP maps.
+///
+/// A timestamp seek over a multi-clip title is a binary search over bytes by PTS, and the clips of a
+/// title often each run their own clock from the same start (both clips of one title from 11.6 s), so
+/// the search cannot tell the clips apart and lands in whichever it meets. The clip's own map does not
+/// need to: the folded title time names the clip, the clip's `in_time` turns it back into that clip's
+/// clock, and the entry gives the byte, so the seek is one byte reposition.
 struct DiscSeekTable: Sendable {
     struct Clip: Sendable {
-        /// 这个剪辑在拼接流里的字节起点
+        /// The clip's first byte in the concatenated title stream.
         let concatByteStart: Int64
-        /// 标题时间轴上这个剪辑之前的总时长（秒，MPLS 的 PlayItem 累计，不受 32 位回绕影响）
+        /// Title time before the clip, from the playlist's play items (wrap-free).
         let cumulativeBeforeSec: Double
-        /// MPLS 的 in_time（秒）：剪辑内原始 PTS 从这里开始算入标题
+        /// The play item's `in_time`: where on the clip's own clock the title starts using it.
         let inTimeSec: Double
         let entries: [CLPIEntryPoint]
     }
 
     let clips: [Clip]
 
-    /// 源时间（剪辑 0 的时间戳基准 + 折叠后的标题时间，秒；生产端对光盘源就是按它定位的）
-    /// → 拼接流里不晚于它的关键帧的字节偏移。某个剪辑没有 EP map 时返回 nil，调用方退回时间二分
+    /// The byte of the last keyframe at or before `seconds` on the demuxer's source axis (clip 0's
+    /// observed timestamp base plus the folded title time, AE#105), with the clip it is in and its time on
+    /// that clip's clock. `base0Sec` is NaN until the first clip's base has been read; the play item's
+    /// `in_time` stands in for it then.
     func keyframe(forSourceSeconds seconds: Double, base0Sec: Double) -> (offset: Int64, clip: Int, keyframeSec: Double)? {
         guard let first = clips.first else { return nil }
         let base = base0Sec.isFinite ? base0Sec : first.inTimeSec
@@ -109,7 +114,7 @@ struct DiscSeekTable: Sendable {
         guard let k = clips.lastIndex(where: { $0.cumulativeBeforeSec <= titleTime + 0.001 }) else { return nil }
         let clip = clips[k]
         guard !clip.entries.isEmpty else { return nil }
-        let raw45k = UInt64(max(0, (clip.inTimeSec + (titleTime - clip.cumulativeBeforeSec)) * 45000))
+        let raw45k = UInt64(max(0, (clip.inTimeSec + (titleTime - clip.cumulativeBeforeSec)) * discTickRate))
         var lo = 0
         var hi = clip.entries.count - 1
         var best = 0
@@ -123,29 +128,43 @@ struct DiscSeekTable: Sendable {
             }
         }
         let entry = clip.entries[best]
-        return (clip.concatByteStart + Int64(entry.spn) * 192, k, Double(entry.pts45k) / 45000)
+        return (clip.concatByteStart + Int64(entry.spn) * 192, k, Double(entry.pts45k) / discTickRate)
     }
 }
 
 extension DiscReader {
-    /// [MovieClaw P7] 组装选中标题的定位表：每个已解析的剪辑读自己的 CLPI（KB 级小文件）。
-    /// `resolved` 是拼进流里的剪辑：在播放列表里的下标、剪辑 id、在拼接流里的字节起点
+    /// Distinct clips whose CLPI a seek table reads at most.
+    static let maxSeekTableClips = 256
+
+    /// The selected title's seek table, from the CLPI of each clip the title resolved. `resolved` lists
+    /// those clips with their play item index and their first byte in the concatenated stream. nil when
+    /// the playlist carries no `in_time`s or any clip has no readable EP map, so a title is either sought
+    /// by its maps throughout or by timestamp throughout.
     static func buildSeekTable(title: DiscTitle,
-                               resolved: [(index: Int, clip: String, byteStart: Int64)],
+                               resolved: [(item: Int, clip: String, byteStart: Int64)],
                                readCLPI: (String) -> [UInt8]?) -> DiscSeekTable? {
         guard let inTimes = title.bdClipInTimes, !resolved.isEmpty else { return nil }
-        let cumBefore = title.bdClipCumulativeBeforeTicks ?? []
+        // One small file per distinct clip. A real title has a handful; a title past this is not worth a
+        // request per clip before the first frame, and keeps seeking by timestamp.
+        guard Set(resolved.map(\.clip)).count <= maxSeekTableClips else { return nil }
+        let cumulativeBefore = title.bdClipCumulativeBeforeTicks ?? []
+        var maps: [String: [CLPIEntryPoint]] = [:]
         var clips: [DiscSeekTable.Clip] = []
         for item in resolved {
-            guard item.index < inTimes.count else { return nil }
-            let entries = readCLPI(item.clip).map(CLPIParser.entryPoints) ?? []
+            guard item.item < inTimes.count else { return nil }
+            let entries = maps[item.clip] ?? (readCLPI(item.clip).map(CLPIParser.entryPoints) ?? [])
+            maps[item.clip] = entries
+            guard !entries.isEmpty else {
+                EngineLog.emit("[disc] seek table: clip \(item.clip) has no readable EP map; seeking by timestamp", category: .demux)
+                return nil
+            }
             clips.append(.init(concatByteStart: item.byteStart,
-                               cumulativeBeforeSec: item.index < cumBefore.count ? Double(cumBefore[item.index]) / discTickRate : 0,
-                               inTimeSec: Double(inTimes[item.index]) / discTickRate,
+                               cumulativeBeforeSec: item.item < cumulativeBefore.count
+                                   ? Double(cumulativeBefore[item.item]) / discTickRate : 0,
+                               inTimeSec: Double(inTimes[item.item]) / discTickRate,
                                entries: entries))
         }
-        let usable = clips.filter { !$0.entries.isEmpty }.count
-        EngineLog.emit("[disc] [MovieClaw P7] seek table: \(clips.count) clip(s), \(usable) with EP map, entries=\(clips.map(\.entries.count))", category: .demux)
-        return usable == clips.count ? DiscSeekTable(clips: clips) : nil
+        EngineLog.emit("[disc] seek table: \(clips.count) clip(s), entries=\(clips.map(\.entries.count))", category: .demux)
+        return DiscSeekTable(clips: clips)
     }
 }

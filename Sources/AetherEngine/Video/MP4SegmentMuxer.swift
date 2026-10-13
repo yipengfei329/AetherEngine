@@ -48,10 +48,10 @@ final class MP4SegmentMuxer {
     enum DoviConfigPolicy: Sendable, Equatable {
         /// Stream-copy the record unchanged. Genuine P5, and P8.x on a DV panel.
         case keep
-        /// Drop `AV_PKT_DATA_DOVI_CONF` before write_header. P7's base layer and P8.2 (hvc1 + dvcC
-        /// trips VT -12906), and P8.x on a non-DV panel (-11868).
+        /// Drop `AV_PKT_DATA_DOVI_CONF` before write_header. P8.2 (hvc1 + dvcC trips VT -12906), AVC
+        /// Profile 9, and any source served as its base layer (`dolbyVisionHandling = .baseLayerOnly`).
         case strip
-        /// Rewrite to a valid P8.1: `dv_profile=8`, `compat=1`, `el_present=0`. P7-on-DV-panel
+        /// Rewrite to a valid P8.1: `dv_profile=8`, `compat=1`, `el_present=0`. P7 on every display
         /// (paired with the per-packet RPU conversion) and the malformed "P8.6" compat id (#53).
         case rewriteToProfile81
         /// Rewrite to P5: `dv_profile=5`, `compat=0`, `el_present=0`. AE#455, opt-in. The bitstream
@@ -104,16 +104,36 @@ final class MP4SegmentMuxer {
     struct AudioConfig {
         let codecpar: UnsafePointer<AVCodecParameters>
         let timeBase: AVRational
+        /// A complete sample entry box that replaces the one movenc writes for this track in the init
+        /// segment (#731). Set for APAC, which movenc cannot write: the track is muxed as a stand-in
+        /// codec and its entry swapped here (see `APACSampleEntry`).
+        let soundSampleEntryOverride: Data?
         /// AE#458: ISO 639-2/T for the track's `mdhd`. Nil writes nothing, leaving movenc's `und`.
         let language: String?
 
         init(codecpar: UnsafePointer<AVCodecParameters>,
              timeBase: AVRational,
+             soundSampleEntryOverride: Data? = nil,
              language: String? = nil) {
             self.codecpar = codecpar
             self.timeBase = timeBase
+            self.soundSampleEntryOverride = soundSampleEntryOverride
             self.language = language
         }
+    }
+
+    /// `initBytes` with the audio track's sample entry replaced by `entry` (#731). An init without a
+    /// parseable sound track is forwarded unchanged and logged: AVPlayer then fails the audio naming
+    /// the stand-in codec, which is easier to read than corrupt bytes.
+    static func installingSoundSampleEntry(_ entry: Data?, in initBytes: Data) -> Data {
+        guard let entry else { return initBytes }
+        if let replaced = APACSampleEntry.replacingSoundSampleEntry(in: initBytes, with: entry) { return replaced }
+        EngineLog.emit(
+            "[MP4SegmentMuxer] ERROR: audio sample entry override could not be installed "
+            + "(no sound track in the \(initBytes.count) B init); AVPlayer will read the stand-in",
+            category: .session
+        )
+        return initBytes
     }
 
     /// Result of a segment cut. `deferredAwaitingAudioSampleEntry` is a THIRD state, distinct from both
@@ -335,8 +355,10 @@ final class MP4SegmentMuxer {
         counter.onStorageExhausted = onStorageExhausted
         self.byteCounter = counter
 
+        let sampleEntryOverride = audio?.soundSampleEntryOverride
         self.splitter = FragmentSplitter(
             onHeaderComplete: { initBytes in
+                let initBytes = Self.installingSoundSampleEntry(sampleEntryOverride, in: initBytes)
                 // AE#187 defense-in-depth: strip a zero-sample video `sdtp` from the fragmented init before
                 // forwarding it. The pinned FFmpegBuild (n8.1.2) never writes it, so this is a no-op there;
                 // it neutralizes the box only for a consumer that links an older FFmpeg (a -force_load'ed
@@ -955,6 +977,10 @@ final class MP4SegmentMuxer {
             return nil
         }
 
+        // Drain first, as the cut does. A fragment flush with packets still in the interleaver takes the
+        // first queued packet's DTS as the track end, and when check_pkt had clamped the written samples
+        // above it, movenc's get_cluster_duration aborts the process (StreamX crash 2026-10-10).
+        _ = av_interleaved_write_frame(ctx, nil)
         _ = av_write_frame(ctx, nil)
         _ = av_write_trailer(ctx)
 

@@ -10,13 +10,155 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The surround-downmix warning no longer fires on 5.1 inside a Dolby MAT carrier.** After an APAC
+  session tvOS keeps the HDMI output in the 2-channel MAT carrier it negotiated, so a 5.1 `ec-3` track
+  played next read `output=2` and the log claimed a downmix while the sink played the 5.1 intact (Apple
+  TV 4K into a Sonos, `max=32`). The warning now reads the sink's advertised maximum, and fires only
+  when that is below the track's channel count.
+
+- **TrueHD Atmos rendered to APAC lights Atmos on sinks that need a nudge.** Some sinks show
+  Dolby Atmos for APAC on their own; a Samsung HW-Q990C fed by an Apple TV 4K (tvOS 27.2) never
+  did. While an APAC session plays on tvOS, the engine now loops a silent E-AC-3 stream signalled
+  as Dolby Atmos beside its player (`AtmosOutputActivator`), which brought that soundbar to Atmos
+  before the first frame and kept it there across a seek. The 2 s stream is digital silence
+  written from the specifications by `Scripts/make-silent-atmos.swift`. A media services reset (#597)
+  drops the activator's player along with the engine's, so the next session builds a fresh one.
+
+- **A DVD-Video image without an ISO9660 bridge volume plays its film, not its menu.** DVD recognition
+  only looked for `VIDEO_TS` through ISO9660, so an image that is UDF only (sector 16 starts UDF's BEA01
+  directly) went down the Blu-ray branch, found no `BDMV`, and was opened raw: the session played the
+  first VOB, which is the menu. *The Little Chinese Seamstress* reported 7.9 s and played only its menu;
+  it now reports 6364 s, as its IFO declares, and plays the title set. Such an image now has `VIDEO_TS`
+  listed through UDF once no `BDMV` is found, and the title is built as from ISO9660. A file recorded as
+  runs that do not continue each other is left out of the title. The UDF anchor is still read once, so a
+  source that is no disc costs the same probe reads as before. `aetherctl disc-inspect` reports such an
+  image as `dvdVideo`.
+
+- **A seek lands on a DVD title, and the playhead holds across cells that restart their timestamps.**
+  A title's VOBs are read as one MPEG-PS, and many discs restart the presentation timestamps at a cell
+  boundary: *The Little Chinese Seamstress* puts its cell 7, at 3569 s of title time, at about 147 s. A
+  seek was a timestamp search over the whole title, which on such discs, and on *He's a Woman, She's a
+  Man* as well, read straight to the end of the title: a 2000 s seek ended the session. The main PGC's
+  cells are now folded onto the title timeline with the clip fold Blu-ray uses (AE#105), each cell's
+  timestamp base measured from its navigation packs (the VOBU start PTS less the cell's elapsed time),
+  and a seek goes to the VOBU's byte through the title's VTS time map. Both discs then landed every
+  seek (2000, 3560, 4500 and 300 s; 2000, 4000 and 500 s) and played on, across cell 7 without a jump
+  in the playhead. A title whose cells do not follow each other, that starts past its first sector, or
+  that has an angle block, or a disc without a time map, reads and seeks as before.
+
+- **Dolby Vision Profile 7 keeps its RPU on a display without Dolby Vision.** The P7 -> 8.1 conversion
+  ran only when the display claimed Dolby Vision; everywhere else the container record was stripped and
+  the HDR10 base layer played on its static metadata alone, with the enhancement-layer NAL units still in
+  every segment. That covered every HDR10 and SDR panel and every Mac, where Dolby Vision is never
+  observed and only a host assertion claims it. It was the Profile 8.1 non-DV route of tvOS 26.0, which
+  Profile 8.1 left behind once its `-11868` stopped reproducing (AE#493). Profile 7 is now converted on
+  every display and served exactly as Profile 8.1 is: `hvc1` + `dvvC` + `SUPPLEMENTAL-CODECS`, so where
+  AVPlayer maps the picture itself (an SDR panel, a Mac) it maps from the RPU, the segments no longer
+  carry an enhancement layer nothing decodes, and `forceDolbyVisionOnNonDVDisplay` applies to Profile 7
+  too. `dolbyVisionConversion` reads `.profile7ToProfile81` on every such session.
+  `dolbyVisionHandling = .baseLayerOnly` is unchanged. Found by dotModded.
+
+## [7.35.1] - 2026-10-12
+
+### Fixed
+
+- **A seek lands on a Blu-ray title whose clips run their clocks over the same range.** A seek over a
+  disc title was a timestamp binary search across the concatenated clips, and when the clips each start
+  their clock at the same value (two clips both from 11.6 s, or the 600 s origin many discs use) the
+  search cannot tell them apart. On *Kotonoha no Niwa* (two clips) the first seek ended the session with
+  `Demuxer: read failed`; on *Himalaya* and *The Road* (three clips) every seek stalled and the playhead
+  stood still. Recognition (of an image and of a `BDMV` folder) now also reads each clip's `BDMV/CLIPINF/*.clpi`, and a seek takes the
+  folded title time to its clip, the clip's `in_time` to the clip's own clock, and the EP map to the
+  keyframe's byte: one byte reposition. All three discs then landed every seek (1500, 3000 and 200 s)
+  and played on. A single-clip title seeks the same way, with fewer requests (125 instead of 173 for a
+  start and three seeks on a remote ISO). A title with any clip lacking a readable EP map seeks by
+  timestamp as before.
+
+- **A live session no longer crashes the app when its segment muxer is torn down.** The teardown flush
+  of the fMP4 segment muxer ran while packets were still queued in libavformat's interleaver. movenc
+  takes the first queued packet as the track's end, and when `check_pkt` had clamped the written samples
+  past it (a sample declaring a duration beyond its successor), `get_cluster_duration` hit
+  `av_assert0(next_dts >= 0)` and aborted the whole process on the `HLSSegmentProducer.pump` thread
+  (reported from an IPTV app, `Assertion next_dts >= 0 failed at libavformat/movenc.c:1247`). The
+  teardown now drains the interleaver first, as the segment cut already did, and FFmpegBuild 3.7.1
+  patches movenc to skip such a packet instead of aborting, which also covers a drain cut short by a
+  write error. `MovencFragmentEndTests` reproduces the abort in a child process; each half alone keeps
+  it from happening.
+
+## [7.35.0] - 2026-10-12
+
 ### Added
 
-- Import the MovieClaw downstream VOD and remote-disc extensions: HTTP BDMV/VIDEO_TS directory sources, CLPI/DVD indexed seeks, persistent source-range caching and prefetch, compact host Matroska Cues, runtime read-ahead controls, constrained-storage recovery, initial audio ordinals, and lower-latency startup/seek handling. Host-facing contracts and tuning switches are documented in `docs/api.md`; `PATCHES.md` records the original patch rationale and real-media regression results.
+- **A Blu-ray ripped as a `BDMV` folder plays over HTTP.** A host hands the folder to `load(source: .custom(reader))`
+  as a `DiscDirectoryReader`, or as the ready-made `HTTPDiscDirectoryReader` with one URL per file, and
+  the engine recognizes it the way it recognizes a Blu-ray ISO: the same bounded playlist scan and title
+  selection, the selected title's clips concatenated in playlist order, and the same multi-clip timeline,
+  chapters and track languages. The origin serves plain files over `Range` and never remuxes the disc. An
+  optional `preferredPlaylist` names the main title, so only that playlist is read. A controlled probe
+  (`limits` or `cancellation`) does not recognize a folder yet.
+- **`heldSourceConnection` now covers the HEVC-in-MPEG-TS HLS VOD ingest: one persistent HTTP/1.1
+  connection, reused across segments.** Some origins refuse a segment over h2 and over freshly
+  opened connections, but serve consecutive requests on one keep-alive connection. With the option
+  set, the AE#268 ingest sends its playlist, key and segment requests over one HTTP/1.1 connection
+  per origin, one segment at a time, and the carriage probe downloads the first segment whole so
+  the producer does not fetch it twice. A new connection opens only when the origin closes one, the
+  origin changes, or a seek abandons a body mid-transfer; a reused connection the origin dropped
+  while idle is retried once on a fresh one. Every open and close is logged with its protocol and
+  request count. TLS validation, the redirect header policy and the body limits are unchanged, and
+  sources without the option keep their transport (#732).
+
+### Fixed
+
+- **A disc title whose clips restart their clock declares a bandwidth AVPlayer can choose.** libavformat
+  divides the source size by the duration it reads off the timestamps, which over such a title is as
+  wrong as the duration itself (AE#105). A 6537 s UHD title whose two clips both start at 11.6 s probed
+  as 388 s and declared `BANDWIDTH=2253434656`; AVPlayer never picked the variant and waited with no
+  item to play. Whenever libavformat produces a rate for a disc title, the rate is now the title's size
+  over its playlist duration (66.9 Mbit/s for that title, which then started playing). A title
+  libavformat gives no rate for, which is what a remote ISO opened by URL gets, keeps the over-declared
+  fallback as before.
+- **The first readyToPlay after launch no longer freezes the host's main thread for seconds.** Since the
+  26 SDKs `AVAsset.load` runs on the caller's actor, and the native host read every track's format
+  descriptions on the main actor. The first audio format description a process builds loads the audio
+  DSP stack through dyld, measured at 3.8 s on an Apple TV 4K, so the host UI stalled while the video
+  kept playing. Those reads now run off the main actor; the logged and published values are unchanged
+  (#735).
+
+## [7.34.1] - 2026-10-11
 
 ### Changed
 
-- The downstream VOD producer uses shorter initial/target segments and progressive delivery, and bitmap OCR prefetch is armed only for native subtitle rendering. The existing upstream package targets, dependencies and examples remain available. This is a downstream contribution draft covering the complete extension set.
+- **TrueHD Atmos to APAC encodes while it decodes.** The object decoder and Apple's APAC encoder
+  each take about a core and ran one after the other on the producer thread, which is what a seek
+  past the produced range waited for. The bridge now hands each rendered chunk to a serial encode
+  queue and decodes the next one meanwhile. The producer waits for the queue only where its
+  segment cutter or open muxer is about to move, so every segment carries the same audio packets
+  as before, byte for byte, on pts-routed and sequential origins alike (#731).
+- **LibTrueHD 2.2.0: the TrueHD object decode is about 30% faster.** Its `truehd` crate copied
+  160-row sample buffers for blocks that are usually 40 samples; truehdd#42 sizes them to the
+  samples they hold, with byte-identical output. Together with the encode queue above, Dolby's
+  Unfold demo now takes 1.40 s instead of 2.73 s (M1, release), 19x real time instead of 10x,
+  which is what a seek past the produced range waits for (#731).
+
+## [7.34.0] - 2026-10-11
+
+### Added
+
+- **TrueHD Atmos keeps its heights.** Apple TV cannot bitstream TrueHD, so the bridge decoded its
+  7.1 presentation and every height and object position was gone. `LoadOptions.objectAudioRendering
+  = .apac(layout)` decodes the Atmos object presentation (bed, up to 15 objects and their metadata,
+  through the new [LibTrueHD](https://github.com/superuser404notfound/LibTrueHD) dependency), renders
+  it into the host's speaker bed (5.1.2 to 9.1.6) with an allocentric constant-power panner, and
+  delivers Apple Positional Audio, which tvOS sends to an Atmos receiver as Dolby MAT and iOS plays as
+  Spatial Audio. A linked peak limiter keeps the bed under full scale, because the APAC encoder carries
+  anything over it through (Dolby's Unfold demo reaches -1.2 dB of reduction). Opt-in and lossy, at
+  320 kbps per bed channel in place of the lossless 7.1; only TrueHD that FFmpeg marks Atmos, at
+  48 kHz, on OS 26+, and any failure to start falls back to `audioBridgeMode`. With the option on, the automatic
+  audio pick prefers TrueHD Atmos over the other tracks of the same language, never across one.
+  `aetherctl serve --atmos-bed 7.1.4 --audio-index N` serves it. Ported from Silo's fork, which offered its
+  implementation as the reference (Silo-Server/AetherEngine#6, #8, #17). (#731)
 
 ## [7.33.2] - 2026-10-09
 

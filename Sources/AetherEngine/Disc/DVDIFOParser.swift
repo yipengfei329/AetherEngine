@@ -81,7 +81,8 @@ enum DVDIFOParser {
     /// duration, the chapters and the stream-language tables all describe the same chain.
     private static func mainPGCOffset(_ data: [UInt8]) -> Int? { mainPGC(data)?.offset }
 
-    /// 主 PGC 的字节偏移与它在 VTS_PGCIT 里的下标（时间表 VTS_TMAPT 按同一个下标排）
+    /// The main program chain's byte offset and its index among the VTS_PGCIT search pointers, which is
+    /// also its index in the time map table (VTS_TMAPT).
     private static func mainPGC(_ data: [UInt8]) -> (offset: Int, index: Int)? {
         guard data.count >= vtsPgcitPointerOffset + 4,
               Array(data[0..<12]) == vtsMagic else { return nil }
@@ -105,10 +106,10 @@ enum DVDIFOParser {
         return bestOffset >= 0 ? (bestOffset, bestIndex) : nil
     }
 
-    // MARK: - [MovieClaw P13] 主 PGC 的 cell 与时间表（DVD 时间轴折叠与按字节定位）
+    // MARK: - Main PGC cells and time map (cell-folded timeline, byte seeks)
 
-    /// 主 PGC 的一个 cell：在标题 VOB（VTSTT_VOBS，从 VTS_NN_1.VOB 起连续编号）里的首尾扇区、播放时长、
-    /// 是否在多角度块里
+    /// One cell of the main program chain: its first and last sector in the title VOBs (VTSTT_VOBS,
+    /// numbered from the start of VTS_NN_1.VOB), its playback time, and whether it sits in an angle block.
     struct Cell: Sendable, Equatable {
         let firstSector: Int
         let lastSector: Int
@@ -116,9 +117,10 @@ enum DVDIFOParser {
         let inAngleBlock: Bool
     }
 
+    /// The VTS_TMAPT sector pointer in the VTSI.
     private static let vtsTmaptiPointerOffset = 0xD4
 
-    /// 主 PGC 按播放顺序的 cell 表；读不懂返回 nil
+    /// The main PGC's cells in playback order; nil when the IFO is not readable that far.
     static func parseMainPGCCells(_ data: [UInt8]) -> [Cell]? {
         guard let pgc = mainPGC(data) else { return nil }
         let nrCells = Int(data[pgc.offset + pgcNrCellsOffset])
@@ -127,15 +129,15 @@ enum DVDIFOParser {
         guard cellTable + nrCells * cellPlaybackEntrySize <= data.count else { return nil }
         return (0..<nrCells).map { c in
             let e = cellTable + c * cellPlaybackEntrySize
-            // 第 0 字节：块模式（高 2 位）、块类型（其后 2 位，1 = 多角度块）
+            // Byte 0: block mode (top 2 bits), then block type (next 2 bits; 1 = angle block).
             let blockType = (Int(data[e]) >> 4) & 0x3
             return Cell(firstSector: be32(data, e + 8), lastSector: be32(data, e + 20),
                         durationSec: dvdTimeSeconds(data, e + pgcPlaybackTimeOffset), inAngleBlock: blockType == 1)
         }
     }
 
-    /// 主 PGC 的时间表（VTS_TMAPT）：第 i 项是标题时间 (i+1)×unit 秒所在 VOBU 的起始扇区（相对 VTSTT_VOBS）。
-    /// 光盘可以不带时间表，这时返回 nil
+    /// The main PGC's time map (VTS_TMAPT): entry i is the first sector, in VTSTT_VOBS, of the VOBU playing
+    /// at title time (i + 1) x `unitSec`. A disc does not have to carry one; nil then.
     static func parseMainTimeMap(_ data: [UInt8]) -> (unitSec: Double, sectors: [Int])? {
         guard let pgc = mainPGC(data), data.count >= vtsTmaptiPointerOffset + 4 else { return nil }
         let tmaptiSector = be32(data, vtsTmaptiPointerOffset)
@@ -149,7 +151,7 @@ enum DVDIFOParser {
         let unit = Int(data[tmap])
         let entries = be16(data, tmap + 2)
         guard unit > 0, entries > 0, tmap + 4 + entries * 4 <= data.count else { return nil }
-        // 最高位是「不连续」标志，其余 31 位是扇区号
+        // The top bit flags a discontinuity; the other 31 are the sector.
         return (Double(unit), (0..<entries).map { be32(data, tmap + 4 + $0 * 4) & 0x7FFF_FFFF })
     }
 

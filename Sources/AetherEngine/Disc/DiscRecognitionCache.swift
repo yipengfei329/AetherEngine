@@ -12,9 +12,9 @@ struct DiscRecognition: Sendable {
     /// Per-clip presentation-offset spans for the selected multi-clip Blu-ray title; empty otherwise.
     /// Cached so a re-open (subtitle side demuxer, reload) rebuilds the same normalized timeline (AE#105).
     let clipTimeline: [ClipSpan]
-    /// [MovieClaw P7] 选中标题的 CLPI 定位表，随识别结果一起缓存
+    /// The selected title's EP-map seek table, cached with it so a re-open seeks the same way.
     let seekTable: DiscSeekTable?
-    /// [MovieClaw P13] 选中 DVD 标题的时间表
+    /// The selected DVD title's time map, cached so a re-open seeks the same way.
     let dvdTimeMap: DVDTimeMap?
 
     init(formatHint: String, titles: [DiscTitle], selectedTitleIndex: Int,

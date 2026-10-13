@@ -1,30 +1,36 @@
 import Foundation
 
-// [MovieClaw P5] 原盘目录（BDMV 文件夹）经 HTTP 直推（仓库 docs/design/disc-direct-play.md）。
-//
-// 引擎原本只认单个镜像文件（ISO 里的 UDF）：多剪辑原盘靠把各 m2ts 在镜像里的字节区间拼成一条虚拟 TS，
-// 再按剪辑折叠时间戳（ClipSpan）。目录形态的原盘是同一件事换个字节来源：目录里每个文件各是一个独立的
-// HTTP 读取器，拼接器按文件大小把它们首尾相接。选主片、拼接、时间轴折叠、章节、STN 语言全部复用 ISO
-// 那套逻辑；服务端只按文件供字节，不起任何进程（NAS 以前要起 ffmpeg concat 换封装，还会丢掉杜比视界
-// 增强层、把 TrueHD 退成 AC-3 核心、字幕整轨不进流）。
-
-/// 原盘目录的字节源：宿主给出目录里的文件清单（相对原盘根目录的路径与字节数），引擎按相对路径开读取器。
-/// 自身不承载字节（`read` 不会被调用）：`DiscReader.wrap` 认出它后改走目录分支。
+/// A Blu-ray disc that a host serves as a FOLDER (the `BDMV` tree, one address per file) rather than
+/// as a single image. Hand one to `load(source: .custom(reader))`: the engine reads the playlists,
+/// selects the title and concatenates its clips the same way it does for a Blu-ray ISO, so titles,
+/// chapters, track languages and the multi-clip timeline (AE#105) all behave as they do there.
+///
+/// A folder carries no bytes of its own: `read` is never called on it. The engine recognizes the
+/// conformance before it reads anything and opens the files it needs through `openDiscFile(_:)`.
 public protocol DiscDirectoryReader: IOReader {
-    /// 目录里可读的文件：相对原盘根目录的路径（如 `BDMV/STREAM/00001.m2ts`，大小写保留盘上原样）与字节数
+    /// Every file of the disc that can be read: its path relative to the disc root, with `/` as the
+    /// separator (`BDMV/STREAM/00001.m2ts`), and its size in bytes.
     var discFiles: [(path: String, size: Int64)] { get }
-    /// 按相对路径（大小写不敏感）开一个新的独立读取器；打不开返回 nil。调用方负责 `close()`
+
+    /// A new, independent reader over one file of `discFiles` (matched case-insensitively), or nil when
+    /// it cannot be opened. The caller closes it.
     func openDiscFile(_ path: String) -> IOReader?
-    /// 宿主指定的主播放列表文件名（如 `00800.mpls`）：给了就只读这一个、直接当主片——服务端的诱饵判定与
-    /// 台账时长同一口径，也省掉逐个读几十上百个播放列表的请求；nil = 读全部、按引擎自己的规则选
+
+    /// The `.mpls` file name of the title to play (`00800.mpls`), when the host already knows it. The
+    /// engine then reads only that playlist and publishes it as the only title; nil reads every playlist
+    /// and selects the main title by the engine's own rules, as on an ISO.
     var preferredPlaylist: String? { get }
 }
 
-/// 经 HTTP（支持 Range）读原盘目录：每个文件一个地址，读取时每个文件各开一个 `HTTPDiscIOReader`。
-public final class HTTPDiscDirectoryReader: DiscDirectoryReader, @unchecked Sendable {
+/// A Blu-ray folder over HTTP: one URL per file, each read through its own range reader, so an origin
+/// serves the disc as plain files and never remuxes it.
+public final class HTTPDiscDirectoryReader: DiscDirectoryReader {
     public struct File: Sendable {
+        /// Path relative to the disc root, `/`-separated (`BDMV/PLAYLIST/00800.mpls`).
         public let path: String
+        /// The file's exact size in bytes.
         public let size: Int64
+        /// Where the file's bytes are served. The origin must honour HTTP `Range`.
         public let url: URL
 
         public init(path: String, size: Int64, url: URL) {
@@ -38,7 +44,8 @@ public final class HTTPDiscDirectoryReader: DiscDirectoryReader, @unchecked Send
     private let httpHeaders: [String: String]
     public let preferredPlaylist: String?
 
-    public init(files: [File], preferredPlaylist: String?, httpHeaders: [String: String] = [:]) {
+    /// `httpHeaders` ride on every range request to every file.
+    public init(files: [File], preferredPlaylist: String? = nil, httpHeaders: [String: String] = [:]) {
         self.files = files
         self.preferredPlaylist = preferredPlaylist
         self.httpHeaders = httpHeaders
@@ -48,52 +55,55 @@ public final class HTTPDiscDirectoryReader: DiscDirectoryReader, @unchecked Send
 
     public func openDiscFile(_ path: String) -> IOReader? {
         guard let file = files.first(where: { $0.path.caseInsensitiveCompare(path) == .orderedSame }) else { return nil }
-        return HTTPDiscIOReader(url: file.url, extraHeaders: httpHeaders)
+        // A small file (a playlist) is read whole, so whether its origin honours ranges does not matter and
+        // the listed size can stand in for the range probe: a folder holds a few hundred playlists, and the
+        // probe doubled the requests recognition made. A clip keeps the probe, which is what refuses an
+        // origin that would answer a range with the whole file.
+        let small = file.size > 0 && file.size <= DiscReader.maxSmallFileBytes
+        return HTTPDiscIOReader(url: file.url, extraHeaders: httpHeaders, knownSize: small ? file.size : nil)
     }
 
-    // 目录本身不是字节流：`DiscReader.wrap` 在读字节之前就认出它
     public func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 { -1 }
     public func seek(offset: Int64, whence: Int32) -> Int64 { -1 }
     public func close() {}
-    public func cancel() {}
 
-    /// 字幕侧读、拖动预览要独立游标：同一份清单再开一个（文件读取器各自按需打开）
+    /// The side readers (subtitles, scrub previews) need a cursor of their own: the same listing again,
+    /// whose files open on demand.
     public func makeIndependentReader() -> IOReader? {
         HTTPDiscDirectoryReader(files: files, preferredPlaylist: preferredPlaylist, httpHeaders: httpHeaders)
     }
-
-    public var discImageProbeEnabled: Bool { true }
 }
 
-/// 把若干个独立文件按顺序首尾相接成一条连续、可跳转的字节流（原盘目录里主片的各个 m2ts）。
-/// 文件读取器按需打开、只留最近用过的几个：多剪辑主片动辄三四十段，不必一次开齐几十条连接。
+/// Independent files presented as one contiguous, seekable byte stream: the clips of a title in a disc
+/// folder. Files open on demand and only the most recently used few stay open, because a multi-clip
+/// title can run to dozens of clips and needs no more than one connection at a time to play.
 final class MultiFileConcatIOReader: IOReader, SourceTransferCounting, @unchecked Sendable {
     struct Segment {
         let path: String
         let size: Int64
     }
 
-    /// 同时保持打开的文件读取器上限：顺序播放只需要当前段，留两段余量给跨段读取与字幕侧读的回看
-    private static let openLimit = 3
+    /// The current clip, plus room for a read across a clip boundary and a seek back into the last one.
+    static let openLimit = 3
 
     private let segments: [Segment]
-    /// 每段在拼接流里的起点（与 `segments` 平行）
+    /// Each segment's first byte in the concatenated stream, parallel to `segments`.
     private let starts: [Int64]
     private let totalLength: Int64
     private let opener: @Sendable (String) -> IOReader?
-    private let lock = NSLock()
+    /// Serializes `read`, `seek` and `close`, and is held across the network. `cancel` never takes it:
+    /// it exists to unblock a read parked under it.
+    private let ioLock = NSLock()
     private var position: Int64 = 0
-    /// 已打开的段：下标 → 读取器；`recent` 记使用先后，超上限关掉最久没用的
+    /// Guards the fields below, and is only ever held briefly.
+    private let stateLock = NSLock()
+    /// Open readers by segment index, and their use order: the least recently used one closes first.
     private var open: [Int: IOReader] = [:]
-    /// 已关掉的文件读取器拉过的字节（上游 `SourceTransferCounting`）：文件读取器按需开关，计数不能随它一起丢
-    private var retiredSourceBytes: Int64 = 0
-
-    /// 原盘目录的源字节（遥测「已从源拉取」）：开着的各文件读取器加上已关掉的
-    var sourceBytesFetched: Int64 {
-        lock.lock(); defer { lock.unlock() }
-        return retiredSourceBytes + open.values.reduce(0) { $0 + ((($1 as? SourceTransferCounting)?.sourceBytesFetched) ?? 0) }
-    }
     private var recent: [Int] = []
+    /// Bytes fetched by readers already closed, so the transfer count survives their eviction.
+    private var retiredSourceBytes: Int64 = 0
+    /// Bumped by `cancel`, so a file that was still opening when it arrived is cancelled once it exists.
+    private var cancelGeneration = 0
 
     init(segments: [Segment], opener: @escaping @Sendable (String) -> IOReader?) {
         self.segments = segments
@@ -108,30 +118,51 @@ final class MultiFileConcatIOReader: IOReader, SourceTransferCounting, @unchecke
         self.totalLength = cursor
     }
 
-    /// 取第 `index` 段的读取器（持锁调用）；打不开返回 nil
+    var sourceBytesFetched: Int64 {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return retiredSourceBytes + open.values.reduce(0) { $0 + Self.fetched($1) }
+    }
+
+    private static func fetched(_ reader: IOReader) -> Int64 {
+        (reader as? SourceTransferCounting)?.sourceBytesFetched ?? 0
+    }
+
+    /// The reader of segment `index`, opening it if needed. Called with `ioLock` held; the open itself
+    /// (a range probe on HTTP) runs outside `stateLock`, so `cancel` never waits for it.
     private func reader(for index: Int) -> IOReader? {
+        stateLock.lock()
         if let existing = open[index] {
             recent.removeAll { $0 == index }
             recent.append(index)
+            stateLock.unlock()
             return existing
         }
+        let generation = cancelGeneration
+        stateLock.unlock()
+
         guard let fresh = opener(segments[index].path) else { return nil }
+
+        stateLock.lock()
+        let cancelledWhileOpening = cancelGeneration != generation
         open[index] = fresh
         recent.append(index)
+        var evicted: [IOReader] = []
         while recent.count > Self.openLimit {
-            let evicted = recent.removeFirst()
-            if let gone = open.removeValue(forKey: evicted) {
-                retiredSourceBytes += (gone as? SourceTransferCounting)?.sourceBytesFetched ?? 0
-                gone.close()
+            if let gone = open.removeValue(forKey: recent.removeFirst()) {
+                retiredSourceBytes += Self.fetched(gone)
+                evicted.append(gone)
             }
         }
+        stateLock.unlock()
+        evicted.forEach { $0.close() }
+        if cancelledWhileOpening { fresh.cancel() }
         return fresh
     }
 
     func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
         guard let buffer, size > 0 else { return -1 }
-        lock.lock(); defer { lock.unlock() }
-        guard position < totalLength else { return 0 }  // EOF
+        ioLock.lock(); defer { ioLock.unlock() }
+        guard position < totalLength else { return 0 }
         var index = starts.lastIndex { $0 <= position } ?? 0
         let toRead = min(Int64(size), totalLength - position)
         var got: Int64 = 0
@@ -154,7 +185,8 @@ final class MultiFileConcatIOReader: IOReader, SourceTransferCounting, @unchecke
                 chunk += Int64(n)
             }
             got += chunk
-            if chunk < want { break }  // 文件比清单短：按已读到的返回，下次读从断点接着来
+            // A file shorter than its listed size: return what arrived, the next read resumes from there.
+            if chunk < want { break }
             index += 1
         }
         position += got
@@ -162,8 +194,8 @@ final class MultiFileConcatIOReader: IOReader, SourceTransferCounting, @unchecke
     }
 
     func seek(offset: Int64, whence: Int32) -> Int64 {
-        if whence == 65536 { return totalLength }  // AVSEEK_SIZE
-        lock.lock(); defer { lock.unlock() }
+        if whence == 65536 { return totalLength }               // AVSEEK_SIZE
+        ioLock.lock(); defer { ioLock.unlock() }
         let target: Int64
         switch whence {
         case SEEK_SET: target = offset
@@ -176,21 +208,25 @@ final class MultiFileConcatIOReader: IOReader, SourceTransferCounting, @unchecke
         return position
     }
 
+    /// Waits for a read in flight, as before the split, so no read is left holding a closed file.
     func close() {
-        lock.lock()
+        ioLock.lock(); defer { ioLock.unlock() }
+        stateLock.lock()
         let readers = Array(open.values)
-        retiredSourceBytes += readers.reduce(0) { $0 + ((($1 as? SourceTransferCounting)?.sourceBytesFetched) ?? 0) }
+        retiredSourceBytes += readers.reduce(0) { $0 + Self.fetched($1) }
         open.removeAll()
         recent.removeAll()
-        lock.unlock()
+        stateLock.unlock()
         readers.forEach { $0.close() }
     }
 
-    /// 转给已打开的文件读取器：停播时解开卡在网络读上的 read
+    /// Passed on to the open file readers, so a stop unblocks a read parked on the network. It takes
+    /// only `stateLock`: the read it is meant to unblock holds `ioLock` for as long as it is parked.
     func cancel() {
-        lock.lock()
+        stateLock.lock()
+        cancelGeneration &+= 1
         let readers = Array(open.values)
-        lock.unlock()
+        stateLock.unlock()
         readers.forEach { $0.cancel() }
     }
 
@@ -198,111 +234,65 @@ final class MultiFileConcatIOReader: IOReader, SourceTransferCounting, @unchecke
         MultiFileConcatIOReader(segments: segments, opener: opener)
     }
 
-    /// 已经是拆好的 TS 流，不再做光盘识别
+    /// Already the title's transport stream; there is no disc left to recognize in it.
     var discImageProbeEnabled: Bool { false }
 }
 
 extension DiscReader {
-    /// [MovieClaw P26] DVD 目录（VIDEO_TS 文件夹）：与读 DVD 镜像同一套（`dvdTitleSet` 选标题、`dvdCellTimeline`
-    /// 折叠 cell 时间轴），只换字节来源——镜像是一段段扇区区间，目录是一个个文件。标题集的 VOB 按分段顺序首尾
-    /// 相接，与镜像里连续的扇区是同一段字节，所以 cell 表与时间表里的偏移原样可用。
-    /// 原来目录分支只认蓝光：服务端把 DVD 目录当「原文件」给，取的是个文件夹，一律 404、App 只好降级
-    static func wrapDVDFolder(_ folder: DiscDirectoryReader, selectTitleID: Int?) -> DiscInfo? {
-        // 目录里只有 VIDEO_TS 这一层；镜像的文件记录带扇区号，目录没有扇区，借同一个记录类型分组、按长度拼接
-        let entries = folder.discFiles.filter { $0.path.uppercased().hasPrefix("VIDEO_TS/") }
-        var pathByName: [String: (path: String, size: Int64)] = [:]
-        let files = entries.map { entry -> DiscFile in
-            let name = String(entry.path.split(separator: "/").last ?? "")
-            pathByName[name.uppercased()] = entry
-            return DiscFile(name: name, startSector: 0, length: Int(entry.size))
-        }
-        // IFO 是 KB 级的小文件；与读播放列表同一个 8 MB 上限，防畸形清单撑爆内存
-        let maxInfoBytes: Int64 = 8 * 1024 * 1024
-        let readFile: (DiscFile) -> [UInt8] = { file in
-            guard let entry = pathByName[file.name.uppercased()], entry.size > 0, entry.size <= maxInfoBytes,
-                  let reader = folder.openDiscFile(entry.path) else { return [] }
-            defer { reader.close() }
-            return readAll(reader, [(offset: 0, length: entry.size)])
-        }
-        guard let set = dvdTitleSet(files: files, selectTitleID: selectTitleID, readFile: readFile) else {
-            EngineLog.emit("[disc] DVD folder: no VTS_NN_P.VOB title set among \(entries.count) VIDEO_TS entries", category: .demux)
-            return nil
-        }
-        let segments = set.vobs.compactMap { vob -> MultiFileConcatIOReader.Segment? in
-            pathByName[vob.name.uppercased()].map { .init(path: $0.path, size: $0.size) }
-        }
-        guard !segments.isEmpty else { return nil }
-        let (cellTimeline, timeMap) = set.selectedIFO.map(dvdCellTimeline) ?? ([], nil)
-        EngineLog.emit("[disc] [MovieClaw P26] DVD folder recognized: \(set.titles.count) title(s), selected \(set.selectedIndex) "
-                       + "VOBs=\(segments.map(\.path)) bytes=\(segments.reduce(0) { $0 + $1.size })", category: .demux)
-        return DiscInfo(reader: MultiFileConcatIOReader(segments: segments, opener: { folder.openDiscFile($0) }),
-                        formatHint: "mpeg", titles: set.titles, selectedTitleIndex: set.selectedIndex,
-                        clipTimeline: cellTimeline, dvdTimeMap: timeMap)
-    }
-
-    /// [MovieClaw P5] 原盘目录：读播放列表、选主片，把主片各剪辑文件首尾相接成一条虚拟 TS 流，
-    /// 并按剪辑给出时间轴折叠（与 `wrapBluRay` 同一套 ClipSpan）。
+    /// A Blu-ray folder: the image path (`wrapBluRay`) with files in place of UDF extents. The playlist scan
+    /// and the clip assembly are the same bounded code, so a folder cannot make recognition do more than
+    /// an image can (audit NET-103).
     static func wrapBluRayFolder(_ folder: DiscDirectoryReader, selectTitleID: Int?) -> DiscInfo? {
         let files = folder.discFiles
-        func entry(_ relative: String) -> (path: String, size: Int64)? {
-            files.first { $0.path.caseInsensitiveCompare(relative) == .orderedSame }
+        let byPath = Dictionary(files.map { ($0.path.uppercased(), $0) }, uniquingKeysWith: { first, _ in first })
+        func file(_ path: String) -> (path: String, size: Int64)? { byPath[path.uppercased()] }
+
+        var playlists = files.filter { $0.path.uppercased().hasPrefix("BDMV/PLAYLIST/") }
+        if let preferred = folder.preferredPlaylist {
+            if let hit = file("BDMV/PLAYLIST/\(preferred)") {
+                playlists = [hit]
+            } else {
+                EngineLog.emit("[disc] BDMV folder: preferred playlist \(preferred) is not in the listing; scanning all", category: .demux)
+            }
         }
-        var playlistPaths = files.map(\.path).filter {
-            let upper = $0.uppercased()
-            return upper.hasPrefix("BDMV/PLAYLIST/") && upper.hasSuffix(".MPLS")
-        }
-        if let preferred = folder.preferredPlaylist, let hit = entry("BDMV/PLAYLIST/\(preferred)") {
-            playlistPaths = [hit.path]
-        }
-        // 播放列表是 KB 级的小文件；与 readAll 同一个 8 MB 上限，防畸形清单撑爆内存
-        let maxPlaylistBytes: Int64 = 8 * 1024 * 1024
-        var parsed: [MPLSPlaylist] = []
-        for path in playlistPaths {
-            guard let size = entry(path)?.size, size > 0, size <= maxPlaylistBytes,
-                  let reader = folder.openDiscFile(path) else { continue }
-            let bytes = readAll(reader, [(offset: 0, length: size)])
-            reader.close()
-            if let playlist = MPLSParser.parse(bytes) { parsed.append(playlist) }
-        }
+        let parsed = scanPlaylists(playlists,
+                                   name: { $0.path.lowercased() },
+                                   extents: { [(offset: 0, length: $0.size)] },
+                                   read: { entry, extents in
+                                       guard let reader = folder.openDiscFile(entry.path) else { return [] }
+                                       defer { reader.close() }
+                                       return readAll(reader, extents)
+                                   })
         let titles = BDTitleSelector.enumerateTitles(parsed)
         guard !titles.isEmpty else {
-            EngineLog.emit("[disc] BDMV folder: no parseable .mpls (\(playlistPaths.count) candidates, preferred=\(folder.preferredPlaylist ?? "-"))", category: .demux)
+            EngineLog.emit("[disc] BDMV folder: no parseable .mpls (\(playlists.count) PLAYLIST entries, \(parsed.count) parsed)", category: .demux)
             return nil
         }
         let selectedIndex = selectTitleID.flatMap { titles.indices.contains($0) ? $0 : nil } ?? 0
         let selected = titles[selectedIndex]
-        let subTicks = selected.bdClipSubtractTicks ?? []
-        let cumBeforeTicks = selected.bdClipCumulativeBeforeTicks ?? []
-        var segments: [MultiFileConcatIOReader.Segment] = []
-        var clipTimeline: [ClipSpan] = []
-        var resolvedClips: [(index: Int, clip: String, byteStart: Int64)] = []  // [MovieClaw P7]
-        var byteStart: Int64 = 0
-        for (k, clip) in (selected.bdClipIDs ?? []).enumerated() {
-            guard let file = entry("BDMV/STREAM/\(clip).m2ts"), file.size > 0 else {
-                EngineLog.emit("[disc] BDMV folder: clip \(clip) listed by the playlist is missing from BDMV/STREAM", category: .demux)
-                continue
-            }
-            resolvedClips.append((k, clip, byteStart))
-            let predictedShift = k < subTicks.count ? Double(subTicks[k]) / discTickRate : 0
-            let cumBeforeSec = k < cumBeforeTicks.count ? Double(cumBeforeTicks[k]) / discTickRate : 0
-            clipTimeline.append(ClipSpan(concatByteStart: byteStart,
-                                         cumulativeBeforeSec: cumBeforeSec,
-                                         predictedShiftSec: predictedShift))
-            segments.append(.init(path: file.path, size: file.size))
-            byteStart += file.size
-        }
+        let assembled = assembleBluRayTitle(
+            clipIDs: selected.bdClipIDs ?? [],
+            subtractTicks: selected.bdClipSubtractTicks ?? [],
+            cumulativeBeforeTicks: selected.bdClipCumulativeBeforeTicks ?? [],
+            piecesOfClip: { clip in
+                guard let stream = file("BDMV/STREAM/\(clip).m2ts"), stream.size > 0 else { return nil }
+                return [MultiFileConcatIOReader.Segment(path: stream.path, size: stream.size)]
+            },
+            length: { (segment: MultiFileConcatIOReader.Segment) in segment.size })
+        let segments = assembled.pieces
+        var clipTimeline = assembled.clipTimeline
         guard !segments.isEmpty else {
-            EngineLog.emit("[disc] BDMV folder: selected title \(selectedIndex) resolved no m2ts in BDMV/STREAM", category: .demux)
+            EngineLog.emit("[disc] BDMV folder: title \(selectedIndex) clips=\(selected.bdClipIDs ?? []) resolved no file in BDMV/STREAM", category: .demux)
             return nil
         }
-        // 与 wrapBluRay 相同：单剪辑、或各剪辑本来就首尾连续（预测偏移全为 0）时不需要折叠
+        // As on an image: a single clip, or clips that already continue each other, need no folding.
         if clipTimeline.count < 2 || !clipTimeline.contains(where: { $0.predictedShiftSec != 0 }) {
             clipTimeline = []
         }
-        EngineLog.emit("[disc] Blu-ray folder recognized: \(titles.count) title(s), selected \(selectedIndex) clips=\(selected.bdClipIDs ?? []) files=\(segments.count) bytes=\(byteStart) clipSpans=\(clipTimeline.count) preferred=\(folder.preferredPlaylist ?? "-")", category: .demux)
-        // [MovieClaw P7] 各剪辑的 CLPI → 按 EP map 定位
-        let seekTable = buildSeekTable(title: selected, resolved: resolvedClips) { clip in
-            guard let info = entry("BDMV/CLIPINF/\(clip).clpi"), info.size > 0, info.size <= maxPlaylistBytes,
+        let totalBytes = segments.reduce(Int64(0)) { $0 + $1.size }
+        EngineLog.emit("[disc] Blu-ray folder recognized: \(titles.count) title(s), selected \(selectedIndex) clips=\(selected.bdClipIDs ?? []) files=\(segments.count) bytes=\(totalBytes) clipSpans=\(clipTimeline.count) preferred=\(folder.preferredPlaylist ?? "-")", category: .demux)
+        let seekTable = buildSeekTable(title: selected, resolved: assembled.resolved) { clip in
+            guard let info = file("BDMV/CLIPINF/\(clip).clpi"), info.size > 0,
                   let reader = folder.openDiscFile(info.path) else { return nil }
             defer { reader.close() }
             return readAll(reader, [(offset: 0, length: info.size)])

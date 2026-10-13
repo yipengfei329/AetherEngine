@@ -556,6 +556,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// off the HDMI route has to know that, or it reads the carrier as a downmix.
     public internal(set) var audioIsAtmosStreamCopy = false
 
+    /// The audio is TrueHD Atmos rendered to APAC (`objectAudioRendering`), which on tvOS needs
+    /// `AtmosOutputActivator` beside the player to reach the receiver as Atmos.
+    var audioIsAPAC = false
+
     /// Producer's `videoShiftPts` in seconds, updated on every gate open. AVPlayer clock =
     /// `source_pts - playlistShiftSeconds`. Lock-guarded: written on pump thread, read on others.
     public var playlistShiftSeconds: Double {
@@ -770,7 +774,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private var silentBridgeFailureSurfaced = false
     /// Session-long FLAC bridge for codecs illegal in fMP4. Engine-owned (not producer-owned) so
     /// encoder state survives producer restarts; `startSegment()` rebases PTS on each restart.
-    var audioBridge: AudioBridge?
+    var audioBridge: (any AudioTranscodingBridge)?
     var segmentPlan: [Segment] = []
 
     /// AE#408: true only while `segmentPlan` is the keyframe-aligned plan, whose boundaries are
@@ -996,6 +1000,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         audioSourceStreamIndexOverride: Int32? = nil,
         undecodableAudioStreamIndices: Set<Int32> = [],
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
+        objectAudioRendering: ObjectAudioRendering = .off,
         isLiveSession: Bool = false,
         dvrWindowSeconds: Double? = nil,
         liveJoinProfile: LiveJoinProfile = .standard,
@@ -1051,6 +1056,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.audioSourceStreamIndexOverride = audioSourceStreamIndexOverride
         self.undecodableAudioStreamIndices = undecodableAudioStreamIndices
         self.audioBridgeMode = audioBridgeMode
+        self.objectAudioRendering = objectAudioRendering
         self.isLiveSession = isLiveSession
         self.dvrWindowSeconds = dvrWindowSeconds
         self.liveJoinProfile = liveJoinProfile
@@ -1238,6 +1244,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Bridge encoder for codecs illegal in fMP4 (TrueHD, DTS, DTS-HD MA, MP3, Opus,
     /// EAC3 from MKV without dec3 extradata).
     let audioBridgeMode: AudioBridgeMode
+
+    /// TrueHD Atmos delivery (#731, see `ObjectAudioRendering`); consulted before `audioBridgeMode`.
+    let objectAudioRendering: ObjectAudioRendering
 
     /// Pre-opened demuxer reused by `start()` to skip `avformat_find_stream_info` (~1-3 s on slow CDN).
     /// Consumed in `start()`; unconsumed instances are closed by `stop()`.
@@ -2002,9 +2011,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     isHEAAC
                         ? "[HLSVideoEngine] audio: HE-AAC (profile=\(acpForHE.profile) frameSize=\(acpForHE.frame_size)), ADTS stream-copy would mis-signal SBR, bridging instead"
                         : "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + "
-                          + Self.encoderLabel(AudioBridge.bridgeEncoder(
+                          + (Self.spatialRenderingLayout(
+                                rendering: objectAudioRendering, codecID: acpForHE.codec_id,
+                                profile: acpForHE.profile, sampleRate: acpForHE.sample_rate)
+                             .map { "Atmos object render into \($0.rawValue), APAC" }
+                             ?? Self.encoderLabel(AudioBridge.bridgeEncoder(
                                 for: audioBridgeMode,
-                                sourceChannels: acpForHE.ch_layout.nb_channels)).uppercased()
+                                sourceChannels: acpForHE.ch_layout.nb_channels)).uppercased())
                           + " re-encode",
                     category: .session
                 )
@@ -2142,8 +2155,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // true on a source whose stream-copy was rejected and bridged to FLAC; objects do not survive
         // that, hence the `.streamCopy` conjunct. Without it a downgraded session would advertise
         // `CHANNELS="16/JOC"` over a FLAC bed, which is worse than saying nothing.
+        // #731: the APAC bed is muxed behind a 2-channel ALAC stand-in, so its bridge states the count.
         let servedAudioChannels: Int? = savedAudioConfig.map {
-            Int($0.codecpar.pointee.ch_layout.nb_channels)
+            $0.bridge?.servedChannelCount ?? Int($0.codecpar.pointee.ch_layout.nb_channels)
         }
         let servedAudioIsAtmosStreamCopy =
             audioIsAtmosStreamCopy && audioDelivery == .streamCopy && savedAudioConfig != nil
@@ -2568,7 +2582,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Snapshot subsystem refs under `restartLock`.
     private func subsystemSnapshot() -> (
         producer: HLSSegmentProducer?, cache: SegmentCache?,
-        server: HLSLocalServer?, demuxer: Demuxer?, audioBridge: AudioBridge?
+        server: HLSLocalServer?, demuxer: Demuxer?, audioBridge: (any AudioTranscodingBridge)?
     ) {
         restartLock.lock()
         defer { restartLock.unlock() }
