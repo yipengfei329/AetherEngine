@@ -1372,7 +1372,8 @@ public final class Demuxer: @unchecked Sendable {
     var bitRate: Int64 {
         guard let ctx = formatContext else { return 0 }
         let declared = ctx.pointee.bit_rate
-        guard declared > 0, let titleSeconds = selectedDiscTitleDurationSeconds, let pb = ctx.pointee.pb else {
+        // [MovieClaw P15] 光盘标题跳过了 libavformat 的时长估算，bit_rate 恒为 0：同样按标题自己的大小 ÷ 播放列表时长算
+        guard let titleSeconds = selectedDiscTitleDurationSeconds, let pb = ctx.pointee.pb else {
             return declared
         }
         let size = avio_size(pb)

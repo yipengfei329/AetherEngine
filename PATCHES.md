@@ -13,6 +13,20 @@ The English host API contract is in [docs/api.md](docs/api.md).
 - Full `swift test --jobs 4` is **not green**: the engine XCTest run executed 718 tests (one skipped, one failure), and Swift Testing executed 4,129 tests across 570 suites with 41 issues. These failures include downstream/upstream assumptions about target segment length, keyframe-index trust, SDR transfer labels, initial range size, held-reader/backpressure behavior, source-probe input limits, and the `LoadOptions` inventory. The known APFS allocation-sensitive cache-trim test also fails, as in the original MovieClaw fork. These checks are retained for upstream reconciliation.
 - The app build and real-media results below were measured against the same downstream engine source in MovieClaw. This contribution is a draft for review of the complete extension set, rather than a merge-ready declaration that the upstream suite has passed.
 
+## Upstream main after 7.35.1 (2026-10-13)
+
+- Merged upstream main (7.35.1 plus #737 and #738). The remote-disc patches now use upstream's
+  implementation: P5 (BDMV folders, #734, with the maintainer's cancel fix 600fb6a0), P7 (CLPI EP-map
+  seeks, #736, folder side d64d7848), P61 (UDF-only DVD images, #737) and P13 (DVD cell timeline and
+  time-map seeks, #738). P26 (VIDEO_TS folders) is the commit of upstream PR #756, cherry-picked as is.
+- P15 skips libavformat's duration estimate for a disc title, so `bit_rate` is 0 there; `Demuxer.bitRate`
+  takes the title's size over its playlist duration whether or not libavformat gave a rate (upstream
+  does so only when it did). P37's estimate stays for non-disc sources.
+- P9 and P18 keep their hooks next to upstream's EP-map / time-map seeks. The fork's
+  `DownstreamPlaybackIntegrationTests` reads upstream's `resolved` / `item` names.
+- Full `swift test --jobs 8`: 747 XCTest cases (one skipped upstream) and 4,390 Swift Testing cases in
+  606 suites, all passing.
+
 ## Upstream 7.33.2 (2026-10-11)
 
 - Merged upstream 7.33.2. Upstream AE#724 (7.32.2) took P13's software-clock rule as its default (only a

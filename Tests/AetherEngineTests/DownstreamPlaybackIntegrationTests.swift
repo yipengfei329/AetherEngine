@@ -46,8 +46,8 @@ struct DownstreamPlaybackIntegrationTests {
                 default: return nil
                 }
             }
-        #expect(title.resolvedClips.map(\.index) == [0, 2, 3])
-        #expect(title.resolvedClips.map(\.byteStart) == [0, 200, 400])
+        #expect(title.resolved.map(\.item) == [0, 2, 3])
+        #expect(title.resolved.map(\.byteStart) == [0, 200, 400])
         #expect(title.clipTimeline.map(\.concatByteStart) == [0, 200, 400])
         #expect(title.extents.count == 3)
     }
