@@ -13,6 +13,16 @@ The English host API contract is in [docs/api.md](docs/api.md).
 - Full `swift test --jobs 4` is **not green**: the engine XCTest run executed 718 tests (one skipped, one failure), and Swift Testing executed 4,129 tests across 570 suites with 41 issues. These failures include downstream/upstream assumptions about target segment length, keyframe-index trust, SDR transfer labels, initial range size, held-reader/backpressure behavior, source-probe input limits, and the `LoadOptions` inventory. The known APFS allocation-sensitive cache-trim test also fails, as in the original MovieClaw fork. These checks are retained for upstream reconciliation.
 - The app build and real-media results below were measured against the same downstream engine source in MovieClaw. This contribution is a draft for review of the complete extension set, rather than a merge-ready declaration that the upstream suite has passed.
 
+## Upstream 7.36.0 (2026-10-14)
+
+- Merged upstream 7.36.0 (DTS:X rendered to APAC over the new LibDTSX dependency, live replay
+  de-duplication #747, origin-slot completion #746, the VideoToolbox session rebuilt after a screen
+  lock #739, chunked playlists #733, LibTrueHD 2.3.0).
+- P27's read-starvation guard now wraps upstream's live replay reader (#747) on the software path's
+  direct read; P60's `bt709CurveColor` sits next to upstream's `seekToInitialProducerStart`.
+- Full `swift test --jobs 8`: 764 XCTest cases (one skipped upstream) and 4,475 Swift Testing cases in
+  615 suites, all passing.
+
 ## Upstream main after 7.35.1 (2026-10-13)
 
 - Merged upstream main (7.35.1 plus #737 and #738). The remote-disc patches now use upstream's
