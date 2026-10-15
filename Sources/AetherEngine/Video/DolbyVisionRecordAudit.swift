@@ -278,3 +278,32 @@ public enum DolbyVisionRecordAudit {
                                 rpu: rpuProfileOfSource(url: url, extraHeaders: extraHeaders))
     }
 }
+
+// MARK: - [MovieClaw P62] 记录与码流矛盾、元数据也不纠正时自动放基础层
+
+extension AetherEngine {
+    /// [MovieClaw P62] 容器记录写 P5、码流 VUI 却声明 BT.2020 YCbCr PQ/HLG、RPU 也没把它纠正成 7/8 时，
+    /// 这次加载自动按 `dolbyVisionHandling = .baseLayerOnly` 走（默认关即上游行为：照记录走 dvh1.05；MovieClaw 打开）
+    nonisolated(unsafe) public static var presentsBaseLayerOfContradictedProfile5 = false
+}
+
+extension DolbyVisionRecordAudit {
+    /// [MovieClaw P62] 这次加载要不要自动放基础层。
+    ///
+    /// 实测形态（2026-10-15）：发布组把流媒体版的 P5 RPU 原样注进另一版的 HDR10 / HDR10+ 基础层，没有转成
+    /// 8.1，于是记录写 P5、VUI 写 BT.2020 PQ，RPU 读出来也是 5。按记录走 dvh1.05，系统把 YCbCr 当 IPT 还原，
+    /// 画面整片偏绿或偏紫；放基础层颜色正确，只少了杜比视界的动态元数据。真 P5 的 VUI 一律不写（IPT 没有
+    /// 对应的码点），所以「记录 P5 + VUI 声明 YCbCr HDR」本身就说明基础层是 YCbCr。RPU 能纠正成 7 / 8 的
+    /// 交给 AE#532 照常走杜比视界；RPU 读不出（自定义读取器、直播不做核对）同样按 VUI 放基础层。
+    /// 宿主自己选过处理方式（非 `.automatic`）时不动。
+    static func presentsBaseLayerAutomatically(
+        enabled: Bool,
+        handling: DolbyVisionHandling,
+        contradicted: Bool,
+        record: Int?,
+        rpu: Int?
+    ) -> Bool {
+        enabled && handling == .automatic && contradicted
+            && correctedProfile(record: record, rpu: rpu) == nil
+    }
+}

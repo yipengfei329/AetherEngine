@@ -4444,18 +4444,16 @@ public final class AetherEngine: ObservableObject {
                     dvBlCompatID: detectedDVBLCompatIDNum,
                     colorTransfer: stream.pointee.codecpar.pointee.color_trc,
                     colorMatrix: stream.pointee.codecpar.pointee.color_space)
-                presentsDolbyVisionBaseLayer = options.dolbyVisionHandling == .baseLayerOnly
-                    && detectedDVBaseLayerPresentable
                 // AE#532: a Profile 5 record over a VUI that contradicts it is the one claim in a
                 // container worth checking against the bitstream, because a Profile 5 RPU cannot carry a
                 // residual or an NLQ and the RPU is therefore proof rather than a guess. Gated on that
                 // pairing, so no other source reads a packet here. `.url` only: a custom reader has no
                 // second open to give, and live is not a class this was reported on.
-                if case .url(let auditURL) = source, !options.isLive,
-                   DolbyVisionRecordAudit.recordIsContradicted(
-                       codecID: detectedCodecID, dvProfile: detectedDVProfileNum,
-                       colorTransfer: stream.pointee.codecpar.pointee.color_trc,
-                       colorMatrix: stream.pointee.codecpar.pointee.color_space) {
+                let recordContradicted = DolbyVisionRecordAudit.recordIsContradicted(
+                    codecID: detectedCodecID, dvProfile: detectedDVProfileNum,
+                    colorTransfer: stream.pointee.codecpar.pointee.color_trc,
+                    colorMatrix: stream.pointee.codecpar.pointee.color_space)
+                if case .url(let auditURL) = source, !options.isLive, recordContradicted {
                     let auditHeaders = options.httpHeaders
                     detectedDVRPUProfile = await BlockingWork.detached(priority: .userInitiated) {
                         DolbyVisionRecordAudit.rpuProfileOfSource(url: auditURL, extraHeaders: auditHeaders)
@@ -4472,6 +4470,22 @@ public final class AetherEngine: ObservableObject {
                               + "; the record stands"),
                         category: .engine)
                 }
+                // [MovieClaw P62] 记录与码流矛盾、RPU 又没纠正成 7 / 8：这次加载自动放基础层。只改这次
+                // 加载的局部选项，`loadedOptions` 仍是宿主给的 `.automatic`，重载时重新核对、结论一致
+                if DolbyVisionRecordAudit.presentsBaseLayerAutomatically(
+                    enabled: Self.presentsBaseLayerOfContradictedProfile5,
+                    handling: options.dolbyVisionHandling,
+                    contradicted: recordContradicted,
+                    record: detectedDVProfileNum,
+                    rpu: detectedDVRPUProfile) {
+                    options.dolbyVisionHandling = .baseLayerOnly
+                    EngineLog.emit(
+                        "[AetherEngine] P62: DV Profile 5 record over a BT.2020 YCbCr VUI and its RPU does not "
+                        + "correct it; presenting the base layer (dolbyVisionHandling=baseLayerOnly for this load)",
+                        category: .engine)
+                }
+                presentsDolbyVisionBaseLayer = options.dolbyVisionHandling == .baseLayerOnly
+                    && detectedDVBaseLayerPresentable
                 if options.dolbyVisionHandling == .baseLayerOnly, detectedFormat == .dolbyVision {
                     EngineLog.emit(
                         presentsDolbyVisionBaseLayer
