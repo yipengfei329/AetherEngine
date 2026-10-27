@@ -79,6 +79,8 @@ final class MP4SegmentMuxer {
         let convertsAnnexBSamples: Bool
         /// The session's framing verdict for this track (audit BIT-104); nil gives the muxer its own.
         let nalFramingLatch: NALFramingLatch?
+        /// A stereo source's signalling (`StereoVideoSignal`); nil leaves the track as the source has it.
+        let stereo: StereoVideoSignal?
 
         init(
             codecpar: UnsafePointer<AVCodecParameters>,
@@ -88,7 +90,8 @@ final class MP4SegmentMuxer {
             colorOverride: ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil,
             convertsAnnexBSamples: Bool = false,
-            nalFramingLatch: NALFramingLatch? = nil
+            nalFramingLatch: NALFramingLatch? = nil,
+            stereo: StereoVideoSignal? = nil
         ) {
             self.codecpar = codecpar
             self.timeBase = timeBase
@@ -98,6 +101,7 @@ final class MP4SegmentMuxer {
             self.extradataOverride = extradataOverride
             self.convertsAnnexBSamples = convertsAnnexBSamples
             self.nalFramingLatch = nalFramingLatch
+            self.stereo = stereo
         }
     }
 
@@ -289,6 +293,13 @@ final class MP4SegmentMuxer {
         return (segmentSoundFirstPts, segmentSoundLastPts)
     }
 
+    /// AE#847: where each track's written samples end, in its own muxer time base, audio before
+    /// the AE#464 offset (the axis the producer stamps). Int64.min until a packet has landed.
+    private(set) var writtenVideoEndPts: Int64 = Int64.min
+    private(set) var writtenAudioEndPts: Int64 = Int64.min
+    /// AE#847: the earliest video pts of the segment being written, Int64.min before its first.
+    private(set) var segmentVideoStartPts: Int64 = Int64.min
+
     let videoOutputStreamIndex: Int32 = 0
     let audioOutputStreamIndex: Int32 = 1
 
@@ -356,9 +367,21 @@ final class MP4SegmentMuxer {
         self.byteCounter = counter
 
         let sampleEntryOverride = audio?.soundSampleEntryOverride
+        let stereo = video.stereo
         self.splitter = FragmentSplitter(
             onHeaderComplete: { initBytes in
-                let initBytes = Self.installingSoundSampleEntry(sampleEntryOverride, in: initBytes)
+                var initBytes = Self.installingSoundSampleEntry(sampleEntryOverride, in: initBytes)
+                if case .framePacked(let packing)? = stereo {
+                    if let packed = StereoVideoSignal.installingViewPacking(packing, in: initBytes) {
+                        initBytes = packed
+                    } else {
+                        EngineLog.emit(
+                            "[MP4SegmentMuxer] ERROR: no video sample entry in the \(initBytes.count) B init "
+                            + "to carry the frame packing; the film plays 2D",
+                            category: .session
+                        )
+                    }
+                }
                 // AE#187 defense-in-depth: strip a zero-sample video `sdtp` from the fragmented init before
                 // forwarding it. The pinned FFmpegBuild (n8.1.2) never writes it, so this is a no-op there;
                 // it neutralizes the box only for a consumer that links an older FFmpeg (a -force_load'ed
@@ -599,6 +622,24 @@ final class MP4SegmentMuxer {
         if let extradata = video.extradataOverride {
             Self.replaceExtradata(videoStream.pointee.codecpar, with: extradata)
         }
+        if video.stereo == .multiview {
+            // movenc writes `lhvC` (the second layer's parameter sets, which the extradata carries after
+            // the base layer's) only for a stream with this disposition, and a new stream has none. The
+            // source's stereo side data stays: from an MP4 it is the `vexu` the film came with.
+            videoStream.pointee.disposition |= AV_DISPOSITION_MULTILAYER
+        } else if videoStream.pointee.codecpar.pointee.nb_coded_side_data > 0,
+                  videoStream.pointee.codecpar.pointee.coded_side_data != nil {
+            // Anything else leaves the source's stereo claim out. movenc turns a Matroska StereoMode into
+            // `st3d` plus a `vexu` with both eye views and no packing, which AVFoundation reads as a
+            // stereo track it cannot split (measured: HasLeft/RightStereoEyeView, no ViewPackingKind);
+            // a packed frame gets Apple's full vexu after write_header instead (`installingViewPacking`),
+            // and a 2D session is plainly 2D.
+            av_packet_side_data_remove(
+                videoStream.pointee.codecpar.pointee.coded_side_data,
+                &videoStream.pointee.codecpar.pointee.nb_coded_side_data,
+                AV_PKT_DATA_STEREO3D
+            )
+        }
         if let audio = audio {
             guard let audioStream = avformat_new_stream(ctx, nil) else {
                 throw MuxerError.streamCreationFailed
@@ -744,6 +785,9 @@ final class MP4SegmentMuxer {
             av_shrink_packet(packet, Int32(complete))
         }
 
+        // The packet is consumed by the write below.
+        let writtenDuration = max(packet.pointee.duration, 0)
+
         // av_write_frame was tried as a leak hypothesis; no impact on 8 MB/s mallocMB growth
         // (leak was Data(d) dispatch_data aliasing in AVIOReader). Reverted to interleaved for
         // cross-stream DTS monotonicity and audio+video re-ordering via libavformat.
@@ -766,6 +810,16 @@ final class MP4SegmentMuxer {
         // routing/placement is untouched, so no audio dropouts. The proactive flush is scoped to
         // AC-3/E-AC-3/TrueHD (audioNeedsParsedPacketForMoov): AAC (and every other codec) never wedges and
         // must keep the exact stock code path, no extra early fragment flush, so nothing perturbs its audio.
+        if rc >= 0, clean.pts != Int64.min {
+            if streamIndex == videoOutputStreamIndex {
+                writtenVideoEndPts = max(writtenVideoEndPts, clean.pts &+ writtenDuration)
+                segmentVideoStartPts = segmentVideoStartPts == Int64.min
+                    ? clean.pts : min(segmentVideoStartPts, clean.pts)
+            } else if streamIndex == audioOutputStreamIndex {
+                writtenAudioEndPts = max(writtenAudioEndPts, clean.pts &- audioDelayTicks &+ writtenDuration)
+            }
+        }
+
         if streamIndex == audioOutputStreamIndex {
             audioPacketWritten = true
             if rc >= 0, clean.pts != Int64.min {
@@ -924,6 +978,7 @@ final class MP4SegmentMuxer {
         }
         // New segment starts a fresh buffered-fragment window (#64).
         fragmentWindowFirstVideoDts = Int64.min
+        segmentVideoStartPts = Int64.min
 
         // 2. Snapshot the completed segment + reset counters.
         let completedPath = currentStagingPath
@@ -1227,20 +1282,18 @@ final class MP4SegmentMuxer {
     /// target; when it is illegal too there is nothing to copy from and inventing a value would be a guess.
     /// Bisected on the reporter's asset: `min_blocksize` alone decides whether the session opens, and
     /// `total_samples` (equally wrong there, describing the pre-cut source) does not, so nothing else moves.
+    /// A field this repair leaves below CoreMedia's real floor of 192 never gets here: the audio route
+    /// bridges that stream instead (AE#764, `FLACStreamInfo`).
     static func sanitizedFLACExtradata(
         _ codecpar: UnsafePointer<AVCodecParameters>
     ) -> [UInt8]? {
-        guard codecpar.pointee.codec_id == AV_CODEC_ID_FLAC,
-              let extradata = codecpar.pointee.extradata,
-              codecpar.pointee.extradata_size >= Int32(flacStreamInfoSize) else { return nil }
+        guard let (minBlockSize, maxBlockSize) = FLACStreamInfo.blockSizes(codecpar),
+              let repaired = FLACStreamInfo.repairedMinBlockSize(min: minBlockSize, max: maxBlockSize),
+              let extradata = codecpar.pointee.extradata else { return nil }
 
         var bytes = [UInt8](UnsafeBufferPointer(start: extradata, count: Int(codecpar.pointee.extradata_size)))
-        let minBlockSize = UInt16(bytes[0]) << 8 | UInt16(bytes[1])
-        let maxBlockSize = UInt16(bytes[2]) << 8 | UInt16(bytes[3])
-        guard minBlockSize < flacMinimumBlockSize, maxBlockSize >= flacMinimumBlockSize else { return nil }
-
-        bytes[0] = UInt8(maxBlockSize >> 8)
-        bytes[1] = UInt8(maxBlockSize & 0xFF)
+        bytes[0] = UInt8(repaired >> 8)
+        bytes[1] = UInt8(repaired & 0xFF)
         EngineLog.emit(
             "[MP4SegmentMuxer] FLAC STREAMINFO min_blocksize=\(minBlockSize) is illegal, "
             + "clamped to max_blocksize=\(maxBlockSize) so dfLa passes CoreMedia validation",
@@ -1248,10 +1301,6 @@ final class MP4SegmentMuxer {
         )
         return bytes
     }
-
-    /// FLAC `STREAMINFO` payload length, and the spec's floor for both blocksize fields.
-    private static let flacStreamInfoSize = 34
-    private static let flacMinimumBlockSize: UInt16 = 16
 
     /// Replace codecpar.extradata using av_malloc + AV_INPUT_BUFFER_PADDING_SIZE pad.
     private static func replaceExtradata(

@@ -1,4 +1,7 @@
+// Only with the TrueHDObjectAudio or DTSXObjectAudio trait (both off by default).
+#if TrueHDObjectAudio || DTSXObjectAudio
 import Foundation
+import CoreMedia
 import AetherLibavcodec
 import AetherLibavutil
 
@@ -41,6 +44,11 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// HLS `CODECS` value for the track.
     let hlsCodecs: String
     var servedChannelCount: Int? { layout.channelCount }
+    let peakOutputBitRate: Int64
+    /// The encoder's packets as a sample-buffer format description, and the frames the encoder
+    /// primes with, for a host that feeds an audio renderer instead of a muxer (see `wrap`).
+    let packetFormatDescription: CMAudioFormatDescription
+    let encoderLeadingFrames: Int
 
     private let srcTimeBase: AVRational
     private let decoder: ObjectAudioDecoding
@@ -82,6 +90,13 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private var stats = AudioBridge.FeedStats()
     private(set) var outputBytesLifetime: Int64 = 0
 
+    /// `LiveTelemetry.objectAudio`: written on the pump thread for every rendered block, read at 1 Hz
+    /// by the telemetry sampler. Behind a lock of its own, so that read never waits for a decode or
+    /// an encode holding `opLock`.
+    private let activityLock = NSLock()
+    private var latestActivity: ObjectAudioActivity?
+    var objectAudioActivity: ObjectAudioActivity? { activityLock.withLock { latestActivity } }
+
     /// AE#641: called once, on the pump thread, when the object decoder has been fed
     /// `silentFeedPacketThreshold` packets in a row without returning a block. The APAC
     /// sample entry is written up front, like FLAC's, so nothing downstream fails on its own and the
@@ -92,15 +107,16 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private static let avNoPTS: Int64 = -0x7FFFFFFFFFFFFFFF - 1
 
     /// Packets the object decoder may take without a block before it counts as producing nothing.
-    /// Not the channel bridge's 64: a TrueHD packet is one 40-frame access unit, and after a start or
-    /// resume mid-stream the decoder waits for the next major sync before its first block. Measured
+    /// Not the channel bridge's default 64 (it takes this bound for TrueHD too, AE#786): a TrueHD
+    /// packet is one 40-frame access unit, and after a start or resume mid-stream the decoder waits
+    /// for the next major sync before its first block. Measured
     /// on Dolby's Unfold demo, that wait was up to 102 access units; at 64 every resume past the
     /// opening seconds was reported as a dead decoder and the session went to `.error` while it
     /// played, ignoring every seek after it. 1200 is a second of TrueHD, still a fraction of a second
     /// of the producer's time. A DTS-HD packet is a 512-frame frame, so for DTS:X it is 12.8 s; the
     /// track was confirmed as DTS:X before the bridge was built, and its decoder outputs from the
     /// third packet after every reset.
-    static let silentFeedPacketThreshold = 1200
+    static let silentFeedPacketThreshold = AudioBridge.trueHDSilentFeedPacketThreshold
 
     init(
         srcTimeBase: AVRational,
@@ -114,10 +130,13 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         levelMeter = BedLevelMeter(layout: layout, sampleRate: Self.sampleRate)
         limiter = PeakLimiter(sampleRate: Self.sampleRate)
         let rate = bitRate ?? layout.channelCount * Self.bitRatePerChannel
+        peakOutputBitRate = Int64(rate)
         let encoder = try APACEncoder(layout: layout, sampleRate: Double(Self.sampleRate), bitRate: rate)
         let pipeline = APACEncodePipeline(
             encoder: encoder, channels: layout.channelCount, bufferFrames: Self.encodeChunkFrames * 4)
         self.pipeline = pipeline
+        packetFormatDescription = encoder.formatDescription
+        encoderLeadingFrames = encoder.leadingFrames
         output = pipeline.takeInitialBuffer()
         soundSampleEntryOverride = APACSampleEntry.sampleEntry(
             magicCookie: encoder.magicCookie, sampleRate: Self.sampleRate)
@@ -362,6 +381,8 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         }
         levelMeter.observe(roles: block.roles, updates: block.updates, configurationChanged: rebuilt)
         levelMeter.measureInput(roles: block.roles, planes: block.planes, frameCount: block.frameCount)
+        let activity = levelMeter.activity
+        activityLock.withLock { latestActivity = activity }
         // Anchor the encoder on the first block after a reset, and keep the encoder's input
         // contiguous with the source afterwards: a gap the decoder skipped (corrupt access units) is
         // filled with silence so everything after it stays on its timestamp.
@@ -501,3 +522,4 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         }
     }
 }
+#endif

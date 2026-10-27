@@ -4,14 +4,6 @@ import Testing
 
 /// 7.28 同步时上游行为与 MovieClaw 补丁的交界处；播放回归另用 PlayerUITests 与 faultlab。
 struct DownstreamPlaybackIntegrationTests {
-    @Test @MainActor func clockHoldFollowsTheRendererReorderWindow() {
-        let renderer = SampleBufferRenderer()
-        renderer.setReorderDepth(SampleBufferRenderer.reorderDepth(forHardwareDecoder: false))
-        #expect(renderer.framesBeforeFirstPresentation == 2)
-        renderer.setReorderDepth(SampleBufferRenderer.reorderDepth(forHardwareDecoder: true))
-        #expect(renderer.framesBeforeFirstPresentation == 5)
-    }
-
     @Test func shortFirstSegmentKeepsTheCheckedTimeline() {
         let plan = HLSVideoEngine.buildUniformSegmentPlan(
             videoTimeBase: .init(num: 1, den: 90_000), sourceDurationSeconds: 10,

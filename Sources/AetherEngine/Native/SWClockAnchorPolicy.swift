@@ -52,13 +52,6 @@ enum SWClockAnchorPolicy {
         return sourceOriginSeconds
     }
 
-    /// [MovieClaw P35] The session zero a VOD load presets from the container origin, whether or not it
-    /// resumes: a play from the head anchors on the origin too, so the first sample does not re-anchor and
-    /// disc chapter jumps can subtract it. Live keeps the first-sample re-anchor.
-    static func vodSessionZero(sourceOriginSeconds: Double, isLive: Bool) -> Double {
-        isLive ? 0 : resumeSessionZero(sourceOriginSeconds: sourceOriginSeconds)
-    }
-
     /// Converts a session-axis position into the source axis.
     ///
     /// The host publishes positions session-relative (`raw - sessionZero`), but the

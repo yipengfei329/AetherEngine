@@ -76,6 +76,8 @@ protocol HLSSegmentProvider: AnyObject {
     var masterCodecs: String? { get }
     var masterResolution: (width: Int, height: Int)? { get }
     var masterVideoRange: HLSVideoRange? { get }
+    /// REQ-VIDEO-LAYOUT on EXT-X-STREAM-INF ("CH-STEREO" for a stereo session); nil omits it.
+    var masterVideoLayout: String? { get }
     var masterBandwidth: Int? { get }
 
     /// SUPPLEMENTAL-CODECS on EXT-X-STREAM-INF. DV P8.1 = "dvh1.08.LL/db1p", P8.4 = "dvh1.08.LL/db4h"; P5 is nil (dvh1.05.LL goes in primary CODECS). AVPlayer's master-level codec filter silently drops variants whose primary CODECS it can't fall back to; bare dvh1 master stalled at fetch 2-3 without advancing to media.m3u8.
@@ -119,6 +121,8 @@ protocol HLSSegmentProvider: AnyObject {
     /// AE#682: true when this session lists an I-frame rendition in its master. The two calls below
     /// answer `iframe_init.mp4` and `iframe{N}.mp4`; both may block on a source read.
     var iFrameRenditionServed: Bool { get }
+    /// What the rendition carries; nil reads as `.keyframes`.
+    var iFrameRenditionFormat: IFrameRenditionFormat? { get }
     func iFrameInitSegment() -> Data?
     func iFrameSegment(at index: Int) -> Data?
 
@@ -130,6 +134,10 @@ protocol HLSSegmentProvider: AnyObject {
 
     /// Block until at least one live segment is ready or timeout elapses. Holds the first live response so AVPlayer never sees an empty playlist (-12888).
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool
+
+    /// `LoadOptions.liveEdgeCushionSeconds` as validated: raises the served `HOLD-BACK` and, with it,
+    /// the first-serve gate's depth and deadline. nil keeps `3 x TARGETDURATION`.
+    var liveEdgeCushionSeconds: Double? { get }
 
     /// LL-HLS blocking reload: block until segment at absolute index exists. Holds AVPlayer's ?_HLS_msn= reload open so it receives the new segment the instant it is cut, not a poll-interval late.
     func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool
@@ -185,6 +193,7 @@ extension HLSSegmentProvider {
     var masterCodecs: String? { nil }
     var masterResolution: (width: Int, height: Int)? { nil }
     var masterVideoRange: HLSVideoRange? { nil }
+    var masterVideoLayout: String? { nil }
     var masterBandwidth: Int? { nil }
     var masterSupplementalCodecs: String? { nil }
     var masterFrameRate: Double? { nil }
@@ -198,6 +207,7 @@ extension HLSSegmentProvider {
     var nativeSubtitleWholeProgram: Bool { false }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { nil }
     var iFrameRenditionServed: Bool { false }
+    var iFrameRenditionFormat: IFrameRenditionFormat? { nil }
     func iFrameInitSegment() -> Data? { nil }
     func iFrameSegment(at index: Int) -> Data? { nil }
     var liveTargetSegmentDuration: Double? { nil }
@@ -214,6 +224,7 @@ extension HLSSegmentProvider {
         )
     }
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool { true }
+    var liveEdgeCushionSeconds: Double? { nil }
     func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool { true }
     func waitForSequentialStartupSegments(timeout: TimeInterval) -> Bool { true }
     var liveBlockingReloadHoldSeconds: TimeInterval { 18.0 }
@@ -507,6 +518,36 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return servedMediaBytes
+    }
+
+    /// AE#682: how long `iframe.m3u8` waits for the first media segment request when the rendition is
+    /// SDR JPEG next to an HDR variant. AVPlayer asks for the main variant's segments before the I-frame
+    /// playlist; one that refused the HDR variant never asks for a segment, and would otherwise play the
+    /// stills as the video instead of failing into the media-playlist fallback.
+    static let iFrameMainVariantWaitSeconds: TimeInterval = 3
+
+    private var _iFrameRenditionWithheld = false
+    /// True once `iframe.m3u8` was answered 404 because no media segment was requested: AVPlayer refused
+    /// the HDR variant, and the item fails with the 404's -1100 instead of a display rejection code.
+    var iFrameRenditionWithheld: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _iFrameRenditionWithheld
+    }
+
+    /// True once a media segment was requested, waiting up to `iFrameMainVariantWaitSeconds`.
+    private func waitForMainVariant() -> Bool {
+        let deadline = Date().addingTimeInterval(Self.iFrameMainVariantWaitSeconds)
+        while true {
+            stateLock.lock()
+            let served = servedMediaBytes, stopping = shouldStop
+            stateLock.unlock()
+            if served { return true }
+            guard !stopping, Date() < deadline else {
+                stateLock.lock(); _iFrameRenditionWithheld = !stopping; stateLock.unlock()
+                return false
+            }
+            Thread.sleep(forTimeInterval: 0.025)
+        }
     }
 
     private var loggedReducedMasterPlaylist = false
@@ -1138,7 +1179,8 @@ final class HLSLocalServer: @unchecked Sendable {
                         }
                     }
                 } else {
-                    _ = p.waitForFirstLiveSegment(timeout: 30.0)
+                    _ = p.waitForFirstLiveSegment(timeout: LiveEdgePolicy.firstServeTimeoutSeconds(
+                        edgeCushionSeconds: p.liveEdgeCushionSeconds))
                 }
             } else if let p = provider, p.playlistType == .event {
                 // Sequential append playlist: hold until the startup segments exist. A fast
@@ -1206,6 +1248,12 @@ final class HLSLocalServer: @unchecked Sendable {
         case "/iframe.m3u8":
             guard let prov = provider, prov.iFrameRenditionServed else {
                 return send404(fd: fd, path: normalizedPath, reason: "no I-frame rendition")
+            }
+            if case .jpeg = prov.iFrameRenditionFormat, !waitForMainVariant() {
+                EngineLog.emit("[HLSLocalServer] i-frame rendition withheld: no media segment requested within "
+                               + "\(Self.iFrameMainVariantWaitSeconds)s, so the HDR variant was refused",
+                               category: .hlsServer)
+                return send404(fd: fd, path: normalizedPath, reason: "main variant not playing")
             }
             let body = Self.buildIFramePlaylistText(provider: prov, subResourceBaseURL: subResourceBaseURL)
             return send200(fd: fd, path: normalizedPath, data: Data(body.utf8),
@@ -1742,7 +1790,9 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         var lines: [String] = []
         lines.append("#EXTM3U")
-        lines.append("#EXT-X-VERSION:7")
+        // A REQ- attribute needs version 12: under 7 AVPlayer refuses the master (-12642, measured on
+        // macOS 27 and the visionOS 27 simulator). Every other master keeps the version it always had.
+        lines.append(provider.masterVideoLayout != nil ? "#EXT-X-VERSION:12" : "#EXT-X-VERSION:7")
         lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
 
         // EXT-X-STREAM-INF attribute order per Apple's HLS Authoring Spec Appendixes: BANDWIDTH, AVERAGE-BANDWIDTH, CODECS, SUPPLEMENTAL-CODECS, RESOLUTION/FRAME-RATE/VIDEO-RANGE, HDCP-LEVEL/CLOSED-CAPTIONS.
@@ -1769,6 +1819,9 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         if let hdcp = provider.masterHDCPLevel {
             streamInfAttrs.append("HDCP-LEVEL=\(hdcp)")
+        }
+        if let layout = provider.masterVideoLayout {
+            streamInfAttrs.append("REQ-VIDEO-LAYOUT=\"\(layout)\"")
         }
         // AE#458: the audio is muxed into the variant, so its rendition carries no URI (RFC 8216 4.3.4.2.1).
         // That tag is the ONLY place AVFoundation reads an audio language from on an HLS asset: measured on
@@ -1822,7 +1875,14 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         lines.append("#EXT-X-STREAM-INF:\(streamInfAttrs.joined(separator: ","))")
         lines.append("media.m3u8")
-        if provider.iFrameRenditionServed {
+        if provider.iFrameRenditionServed,
+           case .jpeg(let width, let height, let jpegBandwidth) = provider.iFrameRenditionFormat {
+            // AE#682: AVKit shows no scrub thumbnail from a PQ or Dolby Vision keyframe, so an HDR
+            // session lists SDR stills, the shape of Apple's own motion JPEG trick-play tier.
+            let iFrameAttrs = ["BANDWIDTH=\(jpegBandwidth)", "CODECS=\"mjpg\"", "RESOLUTION=\(width)x\(height)",
+                               "VIDEO-RANGE=SDR", "URI=\"iframe.m3u8\""]
+            lines.append("#EXT-X-I-FRAME-STREAM-INF:\(iFrameAttrs.joined(separator: ","))")
+        } else if provider.iFrameRenditionServed {
             // AE#682: BANDWIDTH is the variant's, an honest ceiling (one keyframe cannot outweigh the
             // segment it opens). A value below the real peak logs -12318 on every fetch.
             var iFrameAttrs = ["BANDWIDTH=\(bandwidth)", "CODECS=\"\(videoCodecs(of: codecs))\""]
@@ -2053,7 +2113,9 @@ final class HLSLocalServer: @unchecked Sendable {
             // stall-danger zone (-16832) whenever the served window carries less than 3 x TD behind the
             // edge (AE#189: 5.76s long-GOP segments -> TD=6 -> 18s holdback vs a 9.6s startup window). The
             // startup cushion is built to exactly this depth, so the advertised value is always satisfiable.
-            let holdBack = LiveEdgePolicy.holdBackSeconds(targetDuration: targetDuration)
+            // A host's `liveEdgeCushionSeconds` raises both together.
+            let holdBack = LiveEdgePolicy.holdBackSeconds(targetDuration: targetDuration,
+                                                          edgeCushionSeconds: provider.liveEdgeCushionSeconds)
             serverControl.append("HOLD-BACK=\(String(format: "%.3f", holdBack))")
             lines.append("#EXT-X-SERVER-CONTROL:\(serverControl.joined(separator: ","))")
         }

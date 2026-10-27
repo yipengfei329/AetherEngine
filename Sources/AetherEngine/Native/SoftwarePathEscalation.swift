@@ -99,6 +99,7 @@ enum SoftwarePathEscalation {
 
     /// The domain of a media failure, i.e. AVFoundation could not make sense of what it was served.
     static let mediaErrorDomain = "CoreMediaErrorDomain"
+    static let videoConfigurationErrorDomain = "AetherEngine.VideoConfiguration"
 
     /// [MovieClaw P24] 判断用的错误域。AVPlayer 报「无法解码」时外层是 AVFoundationErrorDomain（-11833 找不到解码器、
     /// -11821 解码失败），真正的判决在底层的 CoreMedia 错误里（模拟器上 4K 10 bit HEVC：-11833，底层 -12906）。
@@ -136,5 +137,6 @@ enum SoftwarePathEscalation {
         // The bypass has no local muxer and decodes nothing here, so #461 ignores the option anyway.
         guard !availability.nativeRemoteHLS else { return false }
         return errorDomain == mediaErrorDomain || errorDomain == liveJoinErrorDomain
+            || errorDomain == videoConfigurationErrorDomain
     }
 }

@@ -14,6 +14,18 @@ struct MasterFallbackDecisionTests {
         #expect(MasterFallbackDecision.isMasterRejection(generic))
     }
 
+    @Test("AE#682: a 404 is the HDR variant's refusal only when the server withheld the I-frame playlist")
+    func withheldIFramePlaylist() {
+        let notFound = NSError(domain: NSURLErrorDomain, code: NSURLErrorFileDoesNotExist)
+        #expect(!MasterFallbackDecision.isMasterRejection(notFound))
+        #expect(MasterFallbackDecision.isMasterRejection(notFound, iFramePlaylistWithheld: true))
+        #expect(MasterFallbackDecision.rejectionCode(for: notFound, iFramePlaylistWithheld: true) == -11848)
+        #expect(MasterFallbackDecision.rejectionCode(for: notFound, iFramePlaylistWithheld: false) == -1100)
+        let timeout = NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)
+        #expect(!MasterFallbackDecision.isMasterRejection(timeout, iFramePlaylistWithheld: true))
+        let display = NSError(domain: "AVFoundationErrorDomain", code: -11868)
+        #expect(MasterFallbackDecision.rejectionCode(for: display, iFramePlaylistWithheld: true) == -11868)
+    }
 
     @Test("Display-rejection codes are the two AVFoundation display-reject codes")
     func recognisesRejectionCodes() {
@@ -121,7 +133,11 @@ struct MasterFallbackPositionTests {
             .appendingPathComponent("Sources/AetherEngine/AetherEngine.swift")
         let text = try #require(try? String(contentsOf: source, encoding: .utf8))
         let fn = try #require(text.range(of: "func fallBackToMediaPlaylist("))
-        let body = String(text[fn.lowerBound...].prefix(4000))
+        // The whole function, up to the next declaration: a fixed-length window dropped the call
+        // out of view the moment the function grew (AE#849).
+        let rest = text[fn.upperBound...]
+        let end = rest.range(of: "\n    func ")?.lowerBound ?? rest.endIndex
+        let body = String(text[fn.lowerBound..<end])
         #expect(body.contains("host.mountedStartPosition"))
     }
 }

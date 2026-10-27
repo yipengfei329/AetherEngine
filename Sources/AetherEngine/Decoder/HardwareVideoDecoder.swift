@@ -1,12 +1,13 @@
 import Foundation
 import CoreMedia
 import CoreVideo
+import IOSurface
 import VideoToolbox
 import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
 
-/// VTDecompressionSession-backed HEVC decoder for the SoftwarePlaybackHost pipeline.
+/// VTDecompressionSession-backed HEVC / VP9 decoder for the SoftwarePlaybackHost pipeline.
 /// Owns the decoded-frame pool, IOSurface lifetime, and session teardown explicitly
 /// (AVPlayer's opaque state grows unbounded on long 4K HDR sessions).
 /// Same surface as SoftwareVideoDecoder so the host can swap without rewiring the demux loop.
@@ -21,15 +22,52 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         set { skipLock.lock(); _onFrame = newValue; skipLock.unlock() }
     }
     private var _onFrame: DecodedFrameHandler?
-    /// Not yet wired on the VT side (follow-up: read AV_PKT_DATA_DYNAMIC_HDR10_PLUS before decode,
-    /// mirror SoftwareVideoDecoder.extractHDR10PlusBytes). Flag kept so host wiring stays identical to SW path.
+    /// Fires once (decode thread) on the first packet carrying a valid ST 2094-40 message, as the
+    /// libavcodec decoder does; the engine then moves `videoFormat` to `.hdr10Plus`.
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
+    /// HDR10+ per frame. VideoToolbox outputs in presentation order and the packets arrive in decode
+    /// order, so each packet's payload waits here under its presentation time until its frame comes
+    /// out, and leaves as that frame's `kCMSampleAttachmentKey_HDR10PlusPerFrameData`. Only a PQ
+    /// stream is scanned; HDR10+ describes nothing else. Its own lock: the output callback must not
+    /// take `lock` (see `decode`).
+    private var scansHDR10Plus = false
+    private var hdr10PlusFraming = VideoNALFraming.lengthPrefixed(size: 4)
+    private var seenHDR10Plus = false
+    private let hdr10PlusLock = NSLock()
+    private var hdr10PlusByPTS: [HDR10PlusKey: Data] = [:]
+    private struct HDR10PlusKey: Hashable {
+        let value: CMTimeValue
+        let timescale: CMTimeScale
+        init(_ time: CMTime) { value = time.value; timescale = time.timescale }
+    }
+    /// Far past any reorder depth: entries for frames VideoToolbox never output do not pile up.
+    private static let hdr10PlusPendingLimit = 64
     var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
     var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)?
     private var streamColor = ColorDescription.unspecified
     private var streamCodecID = AV_CODEC_ID_NONE
     private var streamProfile = AV_PROFILE_UNKNOWN
     private var reportedPixelBufferType: OSType = 0
+
+    /// AV1 Dolby Vision Profile 10.1 (`decodesAV1DolbyVision`): every frame gets the RPU of its temporal
+    /// unit attached (`AV1DolbyVisionRPU`), passed from `decode` to the output callback by presentation
+    /// time rather than as the frame refcon, so a frame VideoToolbox drops costs a missing attachment,
+    /// never an over-release.
+    private var attachesAV1DolbyVisionRPU = false
+    private let rpuFrameCopier = FrameCopier()
+    private let rpuTable = AV1DolbyVisionRPUTable(logPrefix: "[HardwareVideoDecoder]")
+
+    /// Whether this device decodes AV1 in hardware (Apple silicon from M3 and A17 Pro on).
+    static var canDecodeAV1InHardware: Bool { VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) }
+
+    /// AV1 Dolby Vision Profile 10.1 on hardware that decodes AV1: the one AV1 stream this decoder
+    /// opens, since Dolby Vision display management needs its RPU on the decoded frame, which only a
+    /// host that decodes the frame itself can put there. Elsewhere, and with
+    /// `AetherEngine.decodesAV1DolbyVisionInSoftware`, `SoftwareVideoDecoder` attaches it.
+    static func decodesAV1DolbyVision(stream: UnsafeMutablePointer<AVStream>) -> Bool {
+        canDecodeAV1InHardware && !AV1DolbyVisionRPU.softwareDecodeForced
+            && AV1DolbyVisionRPU.carriesProfile10_1(stream: stream)
+    }
 
     /// Skip pre-seek RASL frames to avoid the "fast forward" effect; decoded for reference but not delivered.
     /// Guarded by `skipLock` not `lock`: close() holds `lock` across VTDecompressionSessionWaitForAsynchronousFrames,
@@ -40,6 +78,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
     private var _skipUntilPTS: CMTime?
     private let skipLock = NSLock()
+
+    var framesDecoded: UInt64 {
+        skipLock.lock(); defer { skipLock.unlock() }; return _framesDecoded
+    }
+    private var _framesDecoded: UInt64 = 0  // guarded by skipLock
 
     /// Clear the skip threshold only if it is still the one we acted on.
     private func clearSkip(ifStillAt threshold: CMTime) {
@@ -57,10 +100,15 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
     private var width: Int32 = 0
     private var height: Int32 = 0
+    private var codecName = "HEVC"
+    /// What `open()` built its format description from, so a VP9 key frame at a new size can get one.
+    private var formatCodecType = kCMVideoCodecType_HEVC
+    private var formatExtensions: NSDictionary?
 
     /// Color metadata from codecpar, re-applied to every CVPixelBuffer.
     /// VTDecompressionSession should propagate these from SPS+hvcC but has been observed not to;
     /// without them an HDR buffer renders as desaturated SDR on AVSampleBufferDisplayLayer.
+    private let outputMetadataNormalizer = VideoToolboxOutputMetadataNormalizer()
     private var colorPrimaries: CFString?
     private var colorTransfer: CFString?
     private var colorMatrix: CFString?
@@ -79,10 +127,38 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Protects `session` across the demux thread (decode), main thread (close/flush), and VT callback (delivery).
     private let lock = NSLock()
 
-    /// AE#492: guarded by `lock`, the same one `flush()` and `decode(packet:epoch:)` take.
+    /// When true, wrap the packet's AVBuffer with a CMBlockBuffer that holds
+    /// an `av_buffer_ref` and unrefs it on disposal (dolby-vision-fel.md §5.4).
+    var useCustomBlockSource: Bool = false
+
+    #if DEBUG
+    /// Called after a packet has been handed to VideoToolbox (whatever the status it returned), and
+    /// not for one the epoch gate or a missing session refused.
+    var onSubmittedToVideoToolboxForTesting: (() -> Void)?
+    var onBlockBufferAllocatedForTesting: ((CMBlockBuffer) -> Void)?
+    #endif
+
+    /// AE#492: the epoch a fed packet must carry. Guarded by `epochLock`, a leaf lock held only for a
+    /// read or a write of this integer (nothing is taken, awaited or called while it is held), so
+    /// `DualLayerVideoDecoder` can move this decoder's epoch from inside its own critical section
+    /// without nesting into `lock`, which `decode` may hold across a blocking VideoToolbox call whose
+    /// output callbacks need the owner's lock. `decode` and `flush()` still read and bump it while
+    /// holding `lock`, so a flush and a feed cannot interleave; `adoptFeedEpoch` alone moves it
+    /// without `lock`, and only ever to the owner's current epoch.
     private var _feedEpoch: UInt64 = 0
-    var feedEpoch: UInt64 {
-        lock.lock(); defer { lock.unlock() }; return _feedEpoch
+    private let epochLock = NSLock()
+    private var currentEpoch: UInt64 {
+        epochLock.lock(); defer { epochLock.unlock() }; return _feedEpoch
+    }
+    var feedEpoch: UInt64 { currentEpoch }
+
+    /// Moves this decoder onto the feed epoch its owner is already in. `DualLayerVideoDecoder` calls it
+    /// (a) when it opens the enhancement decoder lazily, after a `flush()` may have moved its own
+    /// epoch, and (b) from inside its `flush()` critical section, so that a post-seek packet fed with
+    /// the new epoch while the owner is still draining this decoder is accepted, instead of being
+    /// dropped as stale by a decoder that has not yet been flushed. Takes only `epochLock`.
+    func adoptFeedEpoch(_ epoch: UInt64) {
+        epochLock.lock(); _feedEpoch = epoch; epochLock.unlock()
     }
 
     /// AE#739: the system invalidates the session behind our back (iOS screen lock, media services
@@ -102,6 +178,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var awaitingKeyframe = false
     private var droppedAwaitingKeyframe = 0
     private var decoderSpecification: NSDictionary?
+    /// Guarded by `lock`. False for a session opened from parameter sets, which `makeSession` and a
+    /// rebuild then create without `PropagatePerFrameHDRDisplayMetadata`.
+    private var propagatesHDRDisplayMetadata = true
     private var pixelBufferAttributes: NSDictionary?
 
     /// Heap-allocated box carrying a weak self reference for the C decompression callback's refCon.
@@ -112,6 +191,79 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     fileprivate final class RefConBox {
         weak var decoder: HardwareVideoDecoder?
         init(_ decoder: HardwareVideoDecoder) { self.decoder = decoder }
+    }
+
+    /// Keeps `packet.buf` alive for the lifetime of a CMBlockBuffer that wraps
+    /// the packet's data without copying it (dolby-vision-fel.md §5.4).
+    final class CustomBlockSource {
+        var avBuf: UnsafeMutablePointer<AVBufferRef>?
+        let dataPtr: UnsafeMutableRawPointer
+        /// Set by the block source's `FreeBlock`, which releases the retain the refCon carries. CoreMedia
+        /// may call it from inside a failed `CMBlockBufferCreateWithMemoryBlock` (after `AllocateBlock`),
+        /// and `makeBlockBuffer` must then not release that retain a second time.
+        var freeBlockRan = false
+
+        /// `data` is the packet's own payload pointer. It is not always `buf->data`: the Matroska
+        /// demuxer hands out packets whose `data` sits inside a larger buffer (observed at +4 on P7
+        /// MKV remuxes), so block memory taken from `buf->data` starts early and VideoToolbox sees
+        /// a corrupt sample (-12909). Defaults to `buf->data` for callers that own the whole buffer.
+        init?(buf: UnsafeMutablePointer<AVBufferRef>, data: UnsafeMutablePointer<UInt8>? = nil) {
+            guard let data = data ?? buf.pointee.data, let ref = av_buffer_ref(buf) else { return nil }
+            self.avBuf = ref
+            self.dataPtr = UnsafeMutableRawPointer(data)
+        }
+
+        func releaseBuffer() {
+            if avBuf != nil {
+                av_buffer_unref(&avBuf)
+            }
+        }
+
+        deinit {
+            releaseBuffer()
+        }
+    }
+
+    /// Wraps a packet's payload in a CMBlockBuffer without copying it. The block buffer owns
+    /// `blockSource` (and with it the `av_buffer_ref` of `packet.buf`) until CoreMedia frees the
+    /// block; if the buffer cannot be created the reference is released here, so the caller has
+    /// nothing to clean up. `dataLength` is the size of the payload when it differs from the block
+    /// (only a test needs that, to make the creation fail).
+    static func makeBlockBuffer(wrapping blockSource: CustomBlockSource, size: Int, dataLength: Int? = nil) -> (buffer: CMBlockBuffer?, status: OSStatus) {
+        var source = CMBlockBufferCustomBlockSource(
+            version: kCMBlockBufferCustomBlockSourceVersion,
+            AllocateBlock: { refCon, _ in
+                guard let refCon else { return nil }
+                let holder = Unmanaged<CustomBlockSource>.fromOpaque(refCon).takeUnretainedValue()
+                return holder.dataPtr
+            },
+            FreeBlock: { refCon, _memoryBlock, _size in
+                guard let refCon else { return }
+                let holder = Unmanaged<CustomBlockSource>.fromOpaque(refCon).takeRetainedValue()
+                holder.freeBlockRan = true
+                holder.releaseBuffer()
+            },
+            refCon: Unmanaged.passRetained(blockSource).toOpaque()
+        )
+        var blockBuffer: CMBlockBuffer?
+        let status = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: size,
+            blockAllocator: kCFAllocatorNull,
+            customBlockSource: &source,
+            offsetToData: 0,
+            dataLength: dataLength ?? size,
+            flags: kCMBlockBufferAssureMemoryNowFlag,
+            blockBufferOut: &blockBuffer
+        )
+        // `blockSource` is still held by this frame, so reading the flag is safe even after FreeBlock
+        // dropped the refCon's retain. On a failure CoreMedia calls FreeBlock synchronously or not at
+        // all; release here only in the second case.
+        if status != kCMBlockBufferNoErr, !blockSource.freeBlockRan, let refCon = source.refCon {
+            Unmanaged<CustomBlockSource>.fromOpaque(refCon).takeRetainedValue().releaseBuffer()
+        }
+        return (blockBuffer, status)
     }
 
     // MARK: - Lifecycle
@@ -147,33 +299,31 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             )
         }
 
-        let isVP9 = codecpar.pointee.codec_id == AV_CODEC_ID_VP9  // [MovieClaw P14]
-        guard codecpar.pointee.codec_id == AV_CODEC_ID_HEVC || (isVP9 && Self.decodesVP9InHardware(codecpar)) else {
+        if codecpar.pointee.codec_id == AV_CODEC_ID_AV1, !Self.canDecodeAV1InHardware {
             throw VideoDecoderError.unsupportedCodec(id: codecpar.pointee.codec_id.rawValue)
         }
-
-        // 1. Build CMVideoFormatDescription from the hvcC extradata via
-        //    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms (same shape AVFoundation uses for .mp4/.mkv).
-        //    [MovieClaw P14] VP9 没有 extradata：vpcC 由流参数拼出来
-        let atomsDict: NSDictionary
-        if isVP9 {
-            atomsDict = ["vpcC": Self.vpcC(codecpar)]
-        } else {
-            guard let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 else {
-                throw VideoDecoderError.noExtradata
+        let configuration = try VideoToolboxVideoFormat.make(stream: stream)
+        codecName = configuration.codecName
+        formatCodecType = configuration.codecType
+        formatExtensions = configuration.extensions
+        if codecpar.pointee.codec_id == AV_CODEC_ID_VP9 {
+            if #available(macOS 11.0, iOS 26.2, tvOS 26.2, visionOS 26.2, *) {
+                VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9)
             }
-            atomsDict = ["hvcC": Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))]
+            guard VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9) else {
+                throw VideoDecoderError.hardwareDecoderUnavailable(codec: "VP9")
+            }
         }
+
+        // 1. The codec's configuration record (hvcC, av1C, or a vpcC synthesized for WebM VP9) via
+        //    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms; see VideoToolboxVideoFormat.
         var fd: CMVideoFormatDescription?
-        let extensions: NSDictionary = [
-            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atomsDict,
-        ]
         let fdStatus = CMVideoFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
-            codecType: isVP9 ? kCMVideoCodecType_VP9 : kCMVideoCodecType_HEVC,
+            codecType: configuration.codecType,
             width: width,
             height: height,
-            extensions: extensions,
+            extensions: configuration.extensions,
             formatDescriptionOut: &fd
         )
         guard fdStatus == noErr, let formatDesc = fd else {
@@ -188,13 +338,15 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         ]
 
         // 3. Pixel buffer attributes: 10-bit biplanar for HDR, 8-bit for SDR; IOSurface-backed for Metal rendering.
-        let bitsPerSample = codecpar.pointee.bits_per_raw_sample
-        let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
-        let use10Bit = bitsPerSample > 8 || isHDRTransfer
+        let use10Bit = configuration.bitDepth > 8
 
         streamColor = ColorDescription(codecpar: codecpar)
         streamCodecID = codecpar.pointee.codec_id
         streamProfile = codecpar.pointee.profile
+        scansHDR10Plus = codecpar.pointee.color_trc == AVCOL_TRC_SMPTE2084
+        hdr10PlusFraming = .lengthPrefixed(size: NALUnitChain.lengthPrefixSize(
+            codecID: streamCodecID, extradata: codecpar.pointee.extradata,
+            extradataSize: Int(codecpar.pointee.extradata_size)) ?? 4)
         self.colorPrimaries = ColorAttachments.primaries(codecpar.pointee.color_primaries)
         self.colorTransfer = ColorAttachments.transfer(codecpar.pointee.color_trc)
         self.colorMatrix = ColorAttachments.matrix(codecpar.pointee.color_space)
@@ -224,8 +376,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         session = createdSession
 
+        attachesAV1DolbyVisionRPU = Self.decodesAV1DolbyVision(stream: stream)
         EngineLog.emit(
-            "[HardwareVideoDecoder] opened \(isVP9 ? "VP9" : "HEVC") \(width)x\(height) "
+            "[HardwareVideoDecoder] opened \(codecName) \(width)x\(height) "
+            + (attachesAV1DolbyVisionRPU ? "Dolby Vision 10.1 (RPU attached per frame) " : "")
             + "\(use10Bit ? "10-bit" : "8-bit") "
             + "transfer=\(codecpar.pointee.color_trc.rawValue)",
             category: .swPlayback
@@ -251,11 +405,14 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         )
         guard status == noErr, let created = sessionOut else { return (nil, status) }
         // Pass through per-frame HDR metadata for correct tone mapping; unknown-key set returns -12911 on older OSes (swallowed).
-        VTSessionSetProperty(
-            created,
-            key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
-            value: kCFBooleanTrue
-        )
+        // Not on a session opened from parameter sets: see `open(parameterSets:timeBase:onFrame:)`.
+        if propagatesHDRDisplayMetadata {
+            VTSessionSetProperty(
+                created,
+                key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
+                value: kCFBooleanTrue
+            )
+        }
         return (created, noErr)
     }
 
@@ -273,7 +430,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             VTDecompressionSessionInvalidate(old)
             session = nil
         }
-        _feedEpoch &+= 1
+        epochLock.lock(); _feedEpoch &+= 1; epochLock.unlock()
         let created = makeSession(formatDescription: formatDescription, refCon: refConBox)
         guard let fresh = created.session else {
             sessionLost = true
@@ -291,6 +448,46 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         return true
     }
 
+    /// VP9 may change its coded size at any key frame, and a session built for the old size answers
+    /// every frame after it with kVTVideoDecoderBadDataErr, which libavcodec never did. So the key frame
+    /// gets a format description and session of its own size, after the old session has delivered
+    /// what it still holds. Not an epoch change: the packets that follow belong to the same feed.
+    private func adoptVP9FrameSize(_ size: (width: Int32, height: Int32)) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard size.width != width || size.height != height,
+              let old = session, !sessionLost, let refConBox else { return }
+        var fd: CMVideoFormatDescription?
+        let fdStatus = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: formatCodecType,
+            width: size.width,
+            height: size.height,
+            extensions: formatExtensions,
+            formatDescriptionOut: &fd
+        )
+        guard fdStatus == noErr, let formatDesc = fd else {
+            EngineLog.emit("[HardwareVideoDecoder] VP9 resize to \(size.width)x\(size.height): "
+                           + "format description failed (\(fdStatus))", category: .swPlayback)
+            return
+        }
+        VTDecompressionSessionWaitForAsynchronousFrames(old)
+        let created = makeSession(formatDescription: formatDesc, refCon: refConBox)
+        guard let fresh = created.session else {
+            EngineLog.emit("[HardwareVideoDecoder] VP9 resize to \(size.width)x\(size.height): "
+                           + "session refused (\(created.status)), keeping \(width)x\(height)",
+                           category: .swPlayback)
+            return
+        }
+        VTDecompressionSessionInvalidate(old)
+        EngineLog.emit("[HardwareVideoDecoder] VP9 key frame resizes \(width)x\(height) -> "
+                       + "\(size.width)x\(size.height), session rebuilt", category: .swPlayback)
+        session = fresh
+        formatDescription = formatDesc
+        width = size.width
+        height = size.height
+    }
+
     #if DEBUG
     /// Invalidate the live session without forgetting it, which is what the system does on an iOS
     /// screen lock: the next decode returns `kVTInvalidSessionErr`. For the aetherctl harness.
@@ -301,12 +498,117 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
     #endif
 
+    /// Opens a decoder session from raw HEVC parameter sets (VPS, SPS, PPS), used for the Enhancement Layer (EL)
+    /// in Dolby Vision Profile 7 dual-layer decoding.
+    func open(
+        parameterSets: [[UInt8]],
+        timeBase: AVRational,
+        onFrame: @escaping DecodedFrameHandler
+    ) throws {
+        self.onFrame = onFrame
+        self.timeBase = timeBase
+
+        guard parameterSets.count >= 3 else {
+            throw VideoDecoderError.noExtradata
+        }
+
+        var ptrs: [UnsafePointer<UInt8>] = []
+        var sizes: [Int] = []
+        var allocations: [UnsafeMutablePointer<UInt8>] = []
+        defer {
+            for a in allocations { a.deallocate() }
+        }
+        for ps in parameterSets {
+            let p = UnsafeMutablePointer<UInt8>.allocate(capacity: ps.count)
+            ps.withUnsafeBufferPointer { src in
+                if let base = src.baseAddress {
+                    p.initialize(from: base, count: ps.count)
+                }
+            }
+            allocations.append(p)
+            ptrs.append(UnsafePointer(p))
+            sizes.append(ps.count)
+        }
+
+        var fd: CMVideoFormatDescription?
+        let fdStatus = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+            allocator: kCFAllocatorDefault,
+            parameterSetCount: parameterSets.count,
+            parameterSetPointers: ptrs,
+            parameterSetSizes: sizes,
+            nalUnitHeaderLength: 4,
+            extensions: nil,
+            formatDescriptionOut: &fd
+        )
+        guard fdStatus == noErr, let formatDesc = fd else {
+            throw VideoDecoderError.formatDescriptionFailed(status: fdStatus)
+        }
+
+        let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
+        self.width = dims.width
+        self.height = dims.height
+
+        var decoderSpec: NSDictionary?
+        if #available(tvOS 17.0, iOS 17.0, *) {
+            decoderSpec = [
+                kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true,
+            ]
+        }
+
+        self.colorPrimaries = kCVImageBufferColorPrimaries_ITU_R_2020
+        self.colorTransfer = kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+        self.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_2020
+
+        let pixelBufferAttrs: NSDictionary = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelBufferIOSurfacePropertiesKey: NSDictionary(),
+            kCVPixelBufferMetalCompatibilityKey: true,
+        ]
+
+        let box = RefConBox(self)
+        let unmanaged = Unmanaged.passRetained(box)
+
+        // `session` is read by `decode`/`flush`/`close` on other threads: install it under `lock`.
+        lock.lock()
+        propagatesHDRDisplayMetadata = false
+        decoderSpecification = decoderSpec
+        pixelBufferAttributes = pixelBufferAttrs
+        let created = makeSession(formatDescription: formatDesc, refCon: unmanaged)
+        guard let createdSession = created.session else {
+            lock.unlock()
+            unmanaged.release()
+            throw VideoDecoderError.sessionCreationFailed(status: created.status)
+        }
+        formatDescription = formatDesc
+        session = createdSession
+        refConBox = unmanaged
+        lock.unlock()
+
+        // Deliberately no `kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata` here,
+        // unlike `open(stream:)`. This path builds the base layer's session when its parameter sets
+        // arrive in band, and the enhancement layer's session always. The dual-layer decoder
+        // attaches its own Dolby Vision RPU to every frame it delivers (composed or bypassed) from
+        // the RPU it extracted; letting VideoToolbox propagate HDR display metadata as well would put a
+        // second, possibly different, attachment on the base-layer buffer a bypassed frame goes out as.
+
+        EngineLog.emit(
+            "[HardwareVideoDecoder] opened secondary HEVC \(width)x\(height) 10-bit from parameter sets",
+            category: .swPlayback
+        )
+    }
+
     // MARK: - Decode
 
     func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64? = nil) {
+        if streamCodecID == AV_CODEC_ID_VP9, (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0,
+           let data = packet.pointee.data, packet.pointee.size > 0,
+           let size = VideoToolboxVideoFormat.vp9KeyFrameSize(
+            UnsafeBufferPointer(start: data, count: Int(packet.pointee.size))) {
+            adoptVP9FrameSize(size)
+        }
         lock.lock()
         // AE#492: see `SoftwareVideoDecoder.decode`. Same rule, same lock as `flush()`.
-        if let epoch, epoch != _feedEpoch { lock.unlock(); return }
+        if let epoch, epoch != currentEpoch { lock.unlock(); return }
         guard session != nil, !sessionLost, let formatDesc = formatDescription else {
             lock.unlock()
             return
@@ -318,24 +620,43 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // and AVPacket storage is reused for the next packet.
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return }
         let size = Int(packet.pointee.size)
-        let copied = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 1)
-        copied.copyMemory(from: data, byteCount: size)
 
         var blockBuffer: CMBlockBuffer?
-        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: copied,
-            blockLength: size,
-            blockAllocator: kCFAllocatorDefault,  // ← matching dealloc allocator
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: size,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
+        var blockStatus: OSStatus = noErr
+        var copied: UnsafeMutableRawPointer?
+
+        if useCustomBlockSource,
+           let buf = packet.pointee.buf,
+           let blockSource = CustomBlockSource(buf: buf, data: data) {
+            // Design §5.4: no copy. The CMBlockBuffer holds an `av_buffer_ref` of
+            // `packet.buf` and unrefs it in FreeBlock, so VT can retain the data past
+            // the call without a copy.
+            (blockBuffer, blockStatus) = Self.makeBlockBuffer(wrapping: blockSource, size: size)
+            #if DEBUG
+            if let bb = blockBuffer {
+                onBlockBufferAllocatedForTesting?(bb)
+            }
+            #endif
+        } else {
+            // Fallback: copy into newly allocated memory when custom block source is disabled,
+            // packet has no AVBufferRef (e.g. synthetic test packet), or av_buffer_ref failed.
+            copied = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 1)
+            copied?.copyMemory(from: data, byteCount: size)
+            blockStatus = CMBlockBufferCreateWithMemoryBlock(
+                allocator: kCFAllocatorDefault,
+                memoryBlock: copied,
+                blockLength: size,
+                blockAllocator: kCFAllocatorDefault,
+                customBlockSource: nil,
+                offsetToData: 0,
+                dataLength: size,
+                flags: 0,
+                blockBufferOut: &blockBuffer
+            )
+        }
         guard blockStatus == kCMBlockBufferNoErr, let bb = blockBuffer else {
             // CMBlockBuffer takes ownership only on success; we own the allocation on failure.
-            copied.deallocate()
+            copied?.deallocate()
             return
         }
         let pts = SourceTimestampBounds.cmTime(ticks: packet.pointee.pts, timeBase: timeBase)
@@ -364,6 +685,19 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         )
         guard sbStatus == noErr, let sb = sampleBuffer else { return }
 
+        let hdr10PlusPayload = scansHDR10Plus
+            ? HDR10PlusMetadataScan.coreMediaPayload(packet, codecID: streamCodecID, framing: hdr10PlusFraming)
+            : nil
+        if hdr10PlusPayload != nil, !seenHDR10Plus {
+            seenHDR10Plus = true
+            onFirstHDR10PlusDetected?()
+        }
+
+        // Before the send: the output callback can fire before VTDecompressionSessionDecodeFrame returns.
+        if attachesAV1DolbyVisionRPU {
+            rpuTable.store(temporalUnit: UnsafePointer(data), size: size, pts: pts)
+        }
+
         // Tag non-keyframes as DependsOnOthers so VT can drop pre-seek RASL frames after a flush.
         if (packet.pointee.flags & AV_PKT_FLAG_KEY) == 0 {
             if let attachArray = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true),
@@ -384,7 +718,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // while the sample buffer is built lets a pre-seek packet into VT after it. Safe to hold:
         // the output callback never takes `lock`, and `close()` already holds it across the VT wait.
         lock.lock()
-        if let epoch, epoch != _feedEpoch { lock.unlock(); return }
+        if let epoch, epoch != currentEpoch { lock.unlock(); return }
         guard let session = self.session, !sessionLost else { lock.unlock(); return }
         var recoveredAfterDropping: Int?
         if awaitingKeyframe {
@@ -395,6 +729,14 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
             awaitingKeyframe = false
             recoveredAfterDropping = droppedAwaitingKeyframe
+        }
+        // Stored only for a packet that reaches VT (the drops above never output a frame), and before
+        // the call, since VT may output synchronously.
+        if let hdr10PlusPayload {
+            hdr10PlusLock.lock()
+            if hdr10PlusByPTS.count >= Self.hdr10PlusPendingLimit { hdr10PlusByPTS.removeAll() }
+            hdr10PlusByPTS[HDR10PlusKey(pts)] = hdr10PlusPayload
+            hdr10PlusLock.unlock()
         }
         // Async decode with temporal queueing; callback fires on VT's internal queue.
         var infoFlags = VTDecodeInfoFlags()
@@ -407,9 +749,16 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         )
         // AE#739: permanent for this session. Still under the hold that fed it, so a rebuild cannot
         // land between the call and the verdict and have the new session condemned for the old one.
+        if decodeStatus != noErr, hdr10PlusPayload != nil {
+            hdr10PlusLock.lock(); hdr10PlusByPTS.removeValue(forKey: HDR10PlusKey(pts)); hdr10PlusLock.unlock()
+        }
+        if decodeStatus != noErr, attachesAV1DolbyVisionRPU { rpuTable.discard(for: pts) }
         let lostNow = decodeStatus == kVTInvalidSessionErr && !sessionLost
         if lostNow { sessionLost = true }
         lock.unlock()
+        #if DEBUG
+        onSubmittedToVideoToolboxForTesting?()
+        #endif
         if let recoveredAfterDropping {
             EngineLog.emit(
                 "[HardwareVideoDecoder] AE#739 recovered at keyframe pts=\(packet.pointee.pts) "
@@ -432,15 +781,26 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
     }
 
-    func flush() {
+    func flush() { flush(bumpingEpoch: true) }
+
+    /// The flush a `DualLayerVideoDecoder` makes: its owner has already moved this decoder's epoch with
+    /// `adoptFeedEpoch` (inside its own critical section), so bumping it again here would retire the
+    /// post-seek packets the owner has been feeding since.
+    func flushKeepingEpoch() { flush(bumpingEpoch: false) }
+
+    private func flush(bumpingEpoch: Bool) {
         lock.lock()
-        _feedEpoch &+= 1   // AE#492
+        if bumpingEpoch {   // AE#492
+            epochLock.lock(); _feedEpoch &+= 1; epochLock.unlock()
+        }
         let session = self.session
         lock.unlock()
         guard let session else { return }
         // Drain in-flight frames then signal a discontinuity so VT drops its reference picture state.
         VTDecompressionSessionWaitForAsynchronousFrames(session)
         VTDecompressionSessionFinishDelayedFrames(session)
+        hdr10PlusLock.lock(); hdr10PlusByPTS.removeAll(); hdr10PlusLock.unlock()
+        rpuTable.removeAll()
     }
 
     func close() {
@@ -457,6 +817,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             box.release()
             refConBox = nil
         }
+        outputMetadataNormalizer.reset()
         onFrame = nil
     }
 
@@ -483,8 +844,20 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Invoked by `hwDecoderOutputCallback`; delivers CVPixelBuffer+PTS, honouring `skipUntilPTS` for seek-pre-roll.
     fileprivate func handleDecodedFrame(
         imageBuffer: CVImageBuffer,
-        pts: CMTime
+        pts: CMTime,
+        infoFlags: VTDecodeInfoFlags
     ) {
+        skipLock.lock()
+        _framesDecoded &+= 1
+        skipLock.unlock()
+        var hdr10PlusData: Data?
+        if scansHDR10Plus {
+            hdr10PlusLock.lock()
+            hdr10PlusData = hdr10PlusByPTS.removeValue(forKey: HDR10PlusKey(pts))
+            hdr10PlusLock.unlock()
+        }
+        // Taken before the pre-roll skip, so a skipped frame does not leave its RPU in the table.
+        let rpu = attachesAV1DolbyVisionRPU ? rpuTable.take(for: pts) : nil
         if let threshold = skipUntilPTS {
             if CMTimeCompare(pts, threshold) < 0 {
                 return
@@ -493,39 +866,35 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             clearSkip(ifStillAt: threshold)
         }
 
-        // Attach color metadata; without it HDR PQ content shows as desaturated SDR on AVSampleBufferDisplayLayer.
-        if let primaries = colorPrimaries {
-            CVBufferSetAttachment(imageBuffer, kCVImageBufferColorPrimariesKey, primaries, .shouldPropagate)
-        }
+        // A VT output may remain a reference frame after delivery. Only change its metadata
+        // in place when the decoder explicitly grants permission; otherwise use an owned copy.
         // [MovieClaw P60] SDR goes out as sRGB on Mac / iPhone. An undeclared transfer is judged on the tag
         // VideoToolbox read off the SPS VUI, so an HDR stream the container never labelled stays HDR.
-        if ColorAttachments.presentsSDRAsSRGB {
-            let decodedTransfer = colorTransfer
-                ?? (CVBufferCopyAttachment(imageBuffer, kCVImageBufferTransferFunctionKey, nil) as? String).map { $0 as CFString }
-            CVBufferSetAttachment(imageBuffer, kCVImageBufferTransferFunctionKey,
-                                  ColorAttachments.shownTransfer(decodedTransfer), .shouldPropagate)
-        } else if let transfer = colorTransfer {
-            CVBufferSetAttachment(imageBuffer, kCVImageBufferTransferFunctionKey, transfer, .shouldPropagate)
-        }
-        if let matrix = colorMatrix {
-            CVBufferSetAttachment(imageBuffer, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
-        }
-
-        // #354: without this the renderer's format description carries no pixel aspect ratio and
-        // anamorphic content is displayed at its coded dimensions.
-        if let sar = pixelAspectRatio {
-            let aspect: NSDictionary = [
-                kCVImageBufferPixelAspectRatioHorizontalSpacingKey: Int(sar.num),
-                kCVImageBufferPixelAspectRatioVerticalSpacingKey: Int(sar.den),
-            ]
-            CVBufferSetAttachment(imageBuffer, kCVImageBufferPixelAspectRatioKey, aspect, .shouldPropagate)
-        } else {
-            // A recycled pool buffer can carry a stale attachment from an earlier stream.
-            CVBufferRemoveAttachment(imageBuffer, kCVImageBufferPixelAspectRatioKey)
+        let shownTransfer: CFString? = ColorAttachments.presentsSDRAsSRGB
+            ? ColorAttachments.shownTransfer(colorTransfer
+                ?? (CVBufferCopyAttachment(imageBuffer, kCVImageBufferTransferFunctionKey, nil) as? String).map { $0 as CFString })
+            : colorTransfer
+        var outputBuffer = outputMetadataNormalizer.applyingOutputMetadata(
+            to: imageBuffer,
+            isModifiable: infoFlags.contains(.imageBufferModifiable),
+            colorPrimaries: colorPrimaries,
+            transferFunction: shownTransfer,
+            yCbCrMatrix: colorMatrix,
+            pixelAspectRatio: pixelAspectRatio)
+        if attachesAV1DolbyVisionRPU {
+            // On VideoToolbox's own output buffer the attachment is set but never reaches the panel: viewed
+            // on the built-in XDR display, switching the RPU off and on changed nothing, and neither did the
+            // layer's dynamic range, while the same RPU on a copy in a pool of our own was visibly applied
+            // and responded to both (DVLab ab-test2, rounds 1 and 2). So the frame goes out as that copy,
+            // unless the normalizer already handed back one of its own.
+            if outputBuffer === imageBuffer, let copy = rpuFrameCopier.copy(imageBuffer) {
+                outputBuffer = copy
+            }
+            AV1DolbyVisionRPUTable.attach(AV1DolbyVisionRPU.attachEnabled ? rpu : nil, to: outputBuffer)
         }
 
-        reportDecodedFormat(imageBuffer)
-        onFrame?(imageBuffer, pts, nil)
+        reportDecodedFormat(outputBuffer)
+        onFrame?(outputBuffer, pts, hdr10PlusData)
     }
 
     /// VideoToolbox decodes straight into the display buffer, so the buffer IS the decoded picture; its
@@ -563,56 +932,16 @@ private func hwDecoderOutputCallback(
         .fromOpaque(refCon).takeUnretainedValue()
     box.decoder?.handleDecodedFrame(
         imageBuffer: imageBuffer,
-        pts: presentationTimeStamp
+        pts: presentationTimeStamp,
+        infoFlags: infoFlags
     )
 }
 
-// MARK: - [MovieClaw P14] VP9 硬解（VideoToolbox）
-//
-// VP9 原来一律走 libavcodec 软解：真机 4K VP9（《The Age of A.I.》）本进程 CPU 约 48%，连播 7 分钟温度就到「偏热」。
-// iOS 26.2 起 VideoToolbox 的 VP9 解码器是「补充解码器」，登记后才可用（`VTRegisterSupplementalVideoDecoderIfAvailable`）；
-// 登记后照常建 VTDecompressionSession，格式描述用 vpcC（没有 extradata，由流参数拼），包原样送进去。
-extension HardwareVideoDecoder {
-    /// 登记 VP9 补充解码器并确认有硬解（只做一次）
-    static let vp9HardwareAvailable: Bool = {
-        if #available(iOS 26.2, tvOS 26.2, macOS 11.0, visionOS 26.2, *) {
-            VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9)
-            return VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9)
-        }
-        return false
-    }()
-
-    /// 这条 VP9 流交给硬件：有硬解，且是 4:2:0 的 8 / 10 bit（profile 0 / 2）；4:4:4 等少见格式仍软解
-    static func decodesVP9InHardware(_ codecpar: UnsafeMutablePointer<AVCodecParameters>) -> Bool {
-        guard codecpar.pointee.codec_id == AV_CODEC_ID_VP9, vp9HardwareAvailable else { return false }
-        let format = vp9Format(codecpar)
-        return format.chroma <= 1 && (format.depth == 8 || format.depth == 10)
-    }
-
-    /// 位深与色度抽样（vpcC 的编码：0/1 = 4:2:0，2 = 4:2:2，3 = 4:4:4）
-    private static func vp9Format(_ codecpar: UnsafeMutablePointer<AVCodecParameters>) -> (depth: Int, chroma: UInt8) {
-        guard let desc = av_pix_fmt_desc_get(AVPixelFormat(rawValue: codecpar.pointee.format)) else {
-            return (codecpar.pointee.bits_per_raw_sample > 8 ? Int(codecpar.pointee.bits_per_raw_sample) : 8, 1)
-        }
-        let depth = Int(desc.pointee.comp.0.depth)
-        let chroma: UInt8 = desc.pointee.log2_chroma_w == 1 ? (desc.pointee.log2_chroma_h == 1 ? 1 : 2) : 3
-        return (depth, chroma)
-    }
-
-    /// vpcC 盒的内容（version 1、flags 0，后接 VPCodecConfigurationRecord）
-    static func vpcC(_ codecpar: UnsafeMutablePointer<AVCodecParameters>) -> Data {
-        let par = codecpar.pointee
-        let format = vp9Format(codecpar)
-        let profile: UInt8 = (0 ... 3).contains(par.profile) ? UInt8(par.profile) : (format.depth > 8 ? 2 : 0)
-        // 容器多半不写级别：按画面大小给一个够用的（4K 用 5.1）
-        let level: UInt8 = par.level > 0 && par.level < 100 ? UInt8(par.level)
-            : (Int(par.width) * Int(par.height) > 2_228_224 ? (Int(par.width) * Int(par.height) > 8_912_896 ? 61 : 51) : 41)
-        let fullRange: UInt8 = par.color_range == AVCOL_RANGE_JPEG ? 1 : 0
-        return Data([1, 0, 0, 0, profile, level,
-                     UInt8(format.depth << 4) | (format.chroma << 1) | fullRange,
-                     UInt8(truncatingIfNeeded: par.color_primaries.rawValue),
-                     UInt8(truncatingIfNeeded: par.color_trc.rawValue),
-                     UInt8(truncatingIfNeeded: par.color_space.rawValue),
-                     0, 0])
-    }
+/// AE#739: a decoder whose VideoToolbox sessions the system can invalidate behind its back, and that
+/// can build them again. The host recovers through this rather than through one decoder type.
+protocol VideoSessionRebuilding: AnyObject {
+    var onSessionLost: (@Sendable () -> Void)? { get set }
+    @discardableResult func rebuildSession() -> Bool
 }
+
+extension HardwareVideoDecoder: VideoSessionRebuilding {}
