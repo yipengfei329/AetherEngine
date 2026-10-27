@@ -3678,7 +3678,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         applyExtraHeaders(&request)
         // 区间一直到文件尾，应答的 Content-Range 与尾部预读同一个形状：沿用它的校验（206、起点与长度对得上、
         // 不多不少）和跨域跳转不带凭据的规矩
-        let delegate = TailPrefetchDelegate(expectedLength: length, extraHeaders: headers(for: request.url))
+        let delegate = TailPrefetchDelegate(expectedLength: length, diagnosticContext: diagnosticContext,
+                                            extraHeaders: headers(for: request.url))
         delegate.onProgress = { [weak self] in   // [MovieClaw P53]
             guard let self else { return }
             self.winCond.lock()
