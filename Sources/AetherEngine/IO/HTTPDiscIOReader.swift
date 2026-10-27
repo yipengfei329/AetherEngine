@@ -650,6 +650,12 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        onCompletion?()
+        // The prefetch's completion reads this delegate's body and fills its PendingFetch, which holds
+        // the task, which holds this delegate: a cycle that kept every prefetched range alive for the
+        // session (up to 8 MB per request, the whole title's bytes on a long disc playback). It runs
+        // exactly once, so dropping it here breaks the cycle for every caller.
+        let completion = onCompletion
+        onCompletion = nil
+        completion?()
     }
 }
