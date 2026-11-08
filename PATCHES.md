@@ -13,6 +13,30 @@ The English host API contract is in [docs/api.md](docs/api.md).
 - Full `swift test --jobs 4` is **not green**: the engine XCTest run executed 718 tests (one skipped, one failure), and Swift Testing executed 4,129 tests across 570 suites with 41 issues. These failures include downstream/upstream assumptions about target segment length, keyframe-index trust, SDR transfer labels, initial range size, held-reader/backpressure behavior, source-probe input limits, and the `LoadOptions` inventory. The known APFS allocation-sensitive cache-trim test also fails, as in the original MovieClaw fork. These checks are retained for upstream reconciliation.
 - The app build and real-media results below were measured against the same downstream engine source in MovieClaw. This contribution is a draft for review of the complete extension set, rather than a merge-ready declaration that the upstream suite has passed.
 
+## Upstream main after 7.59.0 (2026-11-08)
+
+- Merged upstream main at `90caa0af` (7.59.0 plus AE#996 rounds 2-3 and AE#998: KVO observers no longer
+  decode a typed change value, so a stop after a long watch no longer holds main). 12 files conflicted.
+- Ported onto upstream's rewritten code: P20 (resizable forward window, next to upstream's live
+  `forwardOnly` read-ahead, the AE#923 `setLoadedAudioShaping` write and the `trickleSequential`
+  backpressure park), P21 (forward prefetch only while OCR is armed, on the renamed
+  `embeddedSubtitleDrainTargets`), P23 (prefetch suspension, next to the calibration-pressure park),
+  P25 / P58 (backward window and host Matroska cues, through `forwardBufferSegmentsForSession`),
+  P27 (read starvation guard, wrapped around upstream's live `maximumWait` read), P28 (VOD seek
+  immediate start, next to `publishedClockPeak`), P55 (link rate) and P60 (sRGB SDR `colr`, now the
+  non-P5 branch of upstream's colour override with `videoExtradataOverride`).
+- P35's disc chapter seek is now upstream's `PresentationAxis.discChapterSeekTarget`.
+- P55 now shares upstream's per-generation `genDeliveredBytes` (the trickle watchdog's input, same
+  reset and count) instead of declaring its own; it keeps only `genFirstDataAt` and the rate.
+- AE#986: the three downstream request sites (P49 cues prefetch, the P43 preconnect HEAD and
+  `HTTPDiscIOReader`) build their requests with `URLRequest(engineURL:)`, so they no longer
+  content-sniff. Caught by `Issue986HeldRefusalBodyTests`.
+- FFmpegBuild 3.13.0 and LibTrueHD 3.2.0 follow upstream. Optional components (object audio,
+  dual-layer Dolby Vision, Profile 5 still reshaping, upscaling, audio shaping) stay off by default;
+  MovieClaw enables none of them.
+- Full `swift test` (Xcode 27, arm64 macOS): 833 + 17 XCTest cases (one skipped upstream) and 5,845 Swift
+  Testing cases in 795 suites, all passing.
+
 ## Upstream main after 7.48.0 (2026-10-27)
 
 - Merged upstream main (7.48.0 plus #884 and #886: constant-rate Matroska video muxed on its exact

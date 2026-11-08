@@ -385,7 +385,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         cancelLock.lock(); let stop = cancelled; cancelLock.unlock()
         if stop { return }
         let pending = PendingFetch(offset: offset, length: length)
-        var req = URLRequest(url: url, timeoutInterval: requestTimeout)
+        var req = URLRequest(engineURL: url, timeoutInterval: requestTimeout)
         req.httpMethod = "GET"
         req.setValue(Self.rangeHeader(offset: offset, length: length), forHTTPHeaderField: "Range")
         for (k, v) in extraHeaders { req.setValue(v, forHTTPHeaderField: k) }

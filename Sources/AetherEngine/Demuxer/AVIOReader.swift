@@ -3887,7 +3887,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 category: .demux)
             return
         }
-        var request = URLRequest(url: url)
+        var request = URLRequest(engineURL: url)
         request.setValue("bytes=\(range.lowerBound)-\(range.upperBound - 1)", forHTTPHeaderField: "Range")
         request.timeoutInterval = Self.effectiveDetourBudget(chunkRequestTimeout: chunkRequestTimeout)
         applyExtraHeaders(&request)
@@ -5743,7 +5743,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// 实测每次播放的首个请求中位 83 毫秒，其后同一连接上的冷区域请求 60 毫秒）。只建连接，不读片源、不管结果
     static func preconnect(url: URL, headers: [String: String]) {
         for session in [persistentSession, chunkSession] {
-            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 5)
+            var request = URLRequest(engineURL: url, timeoutInterval: 5)
+            request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
             request.httpMethod = "HEAD"
             for (field, value) in headers { request.setValue(value, forHTTPHeaderField: field) }
             session.dataTask(with: request).resume()
