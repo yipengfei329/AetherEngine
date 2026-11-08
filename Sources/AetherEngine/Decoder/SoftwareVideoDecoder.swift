@@ -34,6 +34,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         var pixelFormat: Int32
         var color: ColorDescription
         var pixelBufferType: OSType = 0
+        var deinterlace: VideoDeinterlace?
     }
 
     /// True when the source is >8-bit (HDR10, AV1 HDR).
@@ -58,6 +59,17 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// display management needs to apply an attached RPU (see `HardwareVideoDecoder.handleDecodedFrame`).
     private var attachesAV1DolbyVisionRPU = false
     private let rpuTable = AV1DolbyVisionRPUTable(logPrefix: "[SWDecoder]")
+
+    /// 10-bit AV1: frames reach P010 on the GPU with their film grain applied there, and dav1d is told at
+    /// open to export the grain instead of applying it (see `GPUFrameConverter`). Nil for everything else,
+    /// which keeps `sws_scale`. Written in `open`, used under `lock` like the sws context.
+    private var gpuConverter: GPUFrameConverter?
+
+    /// Frames the GPU converted, grained and had to copy first; nil when this decoder does not use it.
+    var gpuConversionCounts: (converted: Int, grained: Int, copied: Int)? {
+        lock.lock(); defer { lock.unlock() }
+        return gpuConverter.map { ($0.framesConverted, $0.framesGrained, $0.framesCopied) }
+    }
 
     private var pixelBufferPool: CVPixelBufferPool?
     private var poolWidth = 0
@@ -218,6 +230,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// from one that is not.
     private var loggedSendFailure = false
 
+    /// Configured before open, only for the AVI MPEG-4 software-cache route. Observation metadata
+    /// never supplies frame timestamps; the established reorder/repair algorithm is unchanged.
+    var onCacheTiming: (@Sendable (UInt64, Int64, Int64) -> Void)?
+
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         self.onFrame = onFrame
         deinterlacer.config = deinterlaceConfig
@@ -278,10 +294,21 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
         }
 
+        // 10-bit AV1 converts on the GPU, and its grain is applied there: dav1d only exports the
+        // parameters. Decided before the open, since that is when dav1d reads whether to apply it.
+        gpuConverter = nil
+        if GPUFrameConverter.enabled, codecpar.pointee.codec_id == AV_CODEC_ID_AV1,
+           codecpar.pointee.format == AV_PIX_FMT_YUV420P10LE.rawValue,
+           let converter = GPUFrameConverter() {
+            gpuConverter = converter
+            ctx.pointee.export_side_data |= Int32(AV_CODEC_EXPORT_DATA_FILM_GRAIN)
+        }
+
         // Belt-and-suspenders hwaccel=none: some decoders ignore get_format.
         var opts: OpaquePointer?
         av_dict_set(&opts, "hwaccel", "none", 0)
 
+        if onCacheTiming != nil { ctx.pointee.flags |= AV_CODEC_FLAG_COPY_OPAQUE }
         guard avcodec_open2(ctx, codec, &opts) >= 0 else {
             av_dict_free(&opts)
             throw VideoDecoderError.sessionCreationFailed(status: -2)
@@ -296,7 +323,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         // Release-visible log (no #if DEBUG): needed for TestFlight users and DrHurt #4 black-screen reports.
         EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(use10Bit ? "10-bit" : "8-bit")"
-                       + (attachesAV1DolbyVisionRPU ? ", Dolby Vision 10.1 (RPU attached per frame)" : ""), category: .swPlayback)
+                       + (attachesAV1DolbyVisionRPU ? ", Dolby Vision 10.1 (RPU attached per frame)" : "")
+                       + (gpuConverter != nil ? ", P010 and film grain on the GPU" : ""), category: .swPlayback)
     }
 
     /// #407: the timestamp to put on a decoded frame that carries none, or nil when the frame is
@@ -416,6 +444,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 }
             }
 
+            if let onCacheTiming, let (sourceEpoch, position) = SoftwarePacketCacheIdentity.identity(f) {
+                onCacheTiming(sourceEpoch, position, f.pointee.pts)
+            }
+
             // #131: A53 captions surface as decoded-frame side data on the FFmpeg path (MPEG-2
             // picture user data and friends). Presentation order by construction of decoder output.
             if let onA53 = onA53Captions,
@@ -441,6 +473,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             if isInterlaced || deinterlacer.isActive {
                 if deinterlacer.ensureGraph(frame: f, timeBase: timeBase),
                    deinterlacer.push(f) >= 0 {
+                    decodedFormatKey?.deinterlace = deinterlacer.activeDeinterlace
                     if filtered == nil { filtered = av_frame_alloc() }
                     if let out = filtered {
                         while deinterlacer.pull(into: out) >= 0 {  // filter holds 1-2 frames lookahead; push can yield EAGAIN
@@ -614,6 +647,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             sws_freeContext(swsContext)
             swsContext = nil
         }
+        gpuConverter = nil
         pixelBufferPool = nil
         poolWidth = 0
         poolHeight = 0
@@ -624,6 +658,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         // Nil onFrame inside the lock: emit() reads it under the same lock; unsynchronized write is a data race.
         onFrame = nil
+        onCacheTiming = nil
         lock.unlock()
     }
 
@@ -691,7 +726,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 color: key.color,
                 codecID: codecContext?.pointee.codec_id ?? AV_CODEC_ID_NONE,
                 profile: codecContext?.pointee.profile ?? AV_PROFILE_UNKNOWN),
-            pixelBufferFormat: DecodedVideoFormat.fourCC(key.pixelBufferType)))
+            pixelBufferFormat: DecodedVideoFormat.fourCC(key.pixelBufferType),
+            deinterlace: key.deinterlace))
     }
 
     // MARK: - AVFrame → CVPixelBuffer (sws_scale)
@@ -717,6 +753,19 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             )
         }
 
+        var pixelBuffer: CVPixelBuffer?
+        guard let pool = ensurePixelBufferPool(width: width, height: height, format: outputFormat) else { return nil }
+        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
+        guard status == kCVReturnSuccess, let pb = pixelBuffer else { return nil }
+
+        attachColorSpace(from: frame, to: pb)
+        attachPixelAspectRatio(from: frame, to: pb)
+
+        if let gpuConverter, outputFormat.tenBit, GPUFrameConverter.accepts(frame),
+           gpuConverter.convert(frame, into: pb) {
+            return pb
+        }
+
         swsContext = sws_getCachedContext(
             swsContext,
             Int32(width), Int32(height), srcFmt,
@@ -726,14 +775,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             Int32(SWS_BILINEAR.rawValue), nil, nil, nil
         )
         guard swsContext != nil else { return nil }
-
-        var pixelBuffer: CVPixelBuffer?
-        guard let pool = ensurePixelBufferPool(width: width, height: height, format: outputFormat) else { return nil }
-        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
-        guard status == kCVReturnSuccess, let pb = pixelBuffer else { return nil }
-
-        attachColorSpace(from: frame, to: pb)
-        attachPixelAspectRatio(from: frame, to: pb)
 
         CVPixelBufferLockBaseAddress(pb, [])
         defer { CVPixelBufferUnlockBaseAddress(pb, []) }

@@ -1,13 +1,13 @@
 {
-  "originHash" : "57a37a447c2a37012e3b2cee640fb72b71a0d4ce2282a5131d7cc9a6909daf99",
+  "originHash" : "718a461a9081f41be9aa5745623bf185670f01f098e1782d7d1cc118c1225e41",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/superuser404notfound/FFmpegBuild",
       "state" : {
-        "revision" : "2c7977df9c3e337e4d6a46cc506d7914d7d2b61e",
-        "version" : "3.10.1"
+        "revision" : "9282e592b81d9aa1d699dcc70d46cf6b4d66b55f",
+        "version" : "3.13.0"
       }
     },
     {
@@ -20,12 +20,12 @@
       }
     },
     {
-      "identity" : "nuke",
+      "identity" : "libtruehd",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/kean/Nuke",
+      "location" : "https://github.com/superuser404notfound/LibTrueHD",
       "state" : {
-        "revision" : "30f7a7e72e0607d304fbf69c799474bd5fb6d1ce",
-        "version" : "13.2.0"
+        "revision" : "12b26e487a2ade918e53380d47f5727883fedafc",
+        "version" : "3.2.0"
       }
     },
     {
@@ -35,15 +35,6 @@
       "state" : {
         "revision" : "e636c2b2458930770932a36d311ec9d478575b90",
         "version" : "0.3.1"
-      }
-    },
-    {
-      "identity" : "sparkle",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/sparkle-project/Sparkle",
-      "state" : {
-        "revision" : "eef1a539a373c1f1a320624b1130fc5de7b2e100",
-        "version" : "2.10.0"
       }
     }
   ],

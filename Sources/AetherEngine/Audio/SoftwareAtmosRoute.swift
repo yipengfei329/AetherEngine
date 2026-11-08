@@ -11,15 +11,20 @@ import AetherLibavcodec
 /// - E-AC-3 JOC is stream-copied there. Here the compressed packets go to the audio renderer, which
 ///   decodes Atmos once the process has registered the system's Atmos decoder
 ///   (`AtmosDecoderPrimer`).
-/// - TrueHD Atmos and DTS:X are rendered into a speaker bed and encoded as APAC, as for
-///   `ObjectAudioRendering.apac`, and the APAC packets go to the renderer.
+/// - TrueHD Atmos and DTS:X are rendered into a speaker bed, as on the AVPlayer path, and the bed goes
+///   to the renderer as APAC packets or as PCM in the bed's layout (`SpatialBedFormat`).
 ///
-/// The host opts in with `ObjectAudioRendering.apac`, the engine's one setting for object-audio
-/// delivery; `.off` keeps the PCM decode on every codec.
+/// The host opts in with `ObjectAudioRendering`, the engine's one setting for object-audio delivery;
+/// `.off` keeps the PCM decode on every codec.
 enum SoftwareAtmosRoute: Equatable, Sendable {
     case pcm
     case compressedEAC3JOC
+    /// E-AC-3 JOC decoded by the system's Atmos decoder into the speaker bed, delivered as PCM
+    /// (`SoftwareEAC3AtmosDecoder`). tvOS, where the renderer plays the compressed stream silent.
+    case decodedEAC3JOC(SpatialSpeakerLayout)
     case apac(SpatialSpeakerLayout)
+    /// The rendered bed as PCM in its own layout, as opposed to `.pcm`, the source's decode.
+    case pcmBed(SpatialSpeakerLayout)
 
     /// The route for a track. `confirmedJOC` is whether the first E-AC-3 packets carry the JOC flag
     /// (a container does not declare it reliably, so the host reads it off the stream).
@@ -35,7 +40,9 @@ enum SoftwareAtmosRoute: Equatable, Sendable {
         isLive: Bool,
         rendering: ObjectAudioRendering,
         confirmedJOC: Bool,
-        osSupportsAPAC: Bool = ObjectAudioRendering.isAvailable
+        osSupportsAPAC: Bool = ObjectAudioRendering.isAvailable,
+        decodesJOC: Bool = SoftwareAtmosRoute.decodesJOCOnThisPlatform,
+        routeFormat: @autoclosure () -> SpatialBedFormat = SpatialBedFormat.forCurrentRoute()
     ) -> SoftwareAtmosRoute {
         guard let layout = rendering.layout, !isLive else { return .pcm }
         if codecID == AV_CODEC_ID_EAC3 {
@@ -43,13 +50,18 @@ enum SoftwareAtmosRoute: Equatable, Sendable {
             // Atmos decoder is described for. Anything else keeps the decode it has.
             guard confirmedJOC, channels == 6, sampleRate == 48_000,
                   framesPerPacket == 0 || framesPerPacket == 1536 else { return .pcm }
+            // A PCM bed only: over AirPlay the TrueHD route sends APAC, and a decoded JOC bed there is
+            // unmeasured, so that route keeps the compressed stream it had.
+            if decodesJOC, rendering.bedFormat(routeFormat: routeFormat()) == .lpcm {
+                return .decodedEAC3JOC(layout)
+            }
             return .compressedEAC3JOC
         }
         guard osSupportsAPAC,
               HLSVideoEngine.spatialRenderingLayout(
                 rendering: .apac(layout), codecID: codecID, profile: profile, sampleRate: sampleRate) != nil
         else { return .pcm }
-        return .apac(layout)
+        return rendering.bedFormat(routeFormat: routeFormat()) == .lpcm ? .pcmBed(layout) : .apac(layout)
     }
 
     /// Why `route` kept a TrueHD or DTS track on the PCM decode although object rendering was asked
@@ -81,15 +93,29 @@ enum SoftwareAtmosRoute: Equatable, Sendable {
         return nil
     }
 
-    /// Whether the renderer receives Dolby Atmos on this route, so `AtmosOutputActivator` may bring the
-    /// receiver to Dolby Atmos: compressed E-AC-3 JOC and TrueHD Atmos rendered to APAC are, DTS:X
-    /// rendered to APAC is not.
-    func carriesDolbyAtmos(sourceCodec: AVCodecID) -> Bool {
+    /// Whether E-AC-3 JOC is decoded here rather than handed to the renderer compressed: tvOS, where
+    /// `AVSampleBufferAudioRenderer` plays the compressed stream silent (`SoftwareEAC3AtmosDecoder`).
+    static var decodesJOCOnThisPlatform: Bool {
+        #if os(tvOS)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    /// Whether the route needs the Atmos decoder registered first (`AtmosDecoderPrimer`).
+    var needsAtmosDecoder: Bool {
         switch self {
-        case .pcm: return false
-        case .compressedEAC3JOC: return true
-        case .apac: return sourceCodec == AV_CODEC_ID_TRUEHD
+        case .compressedEAC3JOC, .decodedEAC3JOC: return true
+        case .pcm, .apac, .pcmBed: return false
         }
+    }
+
+    /// Whether this route needs `AtmosOutputActivator` on tvOS: compressed E-AC-3 JOC and every rendered
+    /// bed, TrueHD Atmos or DTS:X. Without it some sinks never switch to Dolby MAT and play the bed as
+    /// stereo or 7.1 PCM, heights folded away.
+    var takesAtmosOutputActivator: Bool {
+        self != .pcm
     }
 
     /// Packets of the source's head the JOC check may look at, and the bytes it may hold. The check

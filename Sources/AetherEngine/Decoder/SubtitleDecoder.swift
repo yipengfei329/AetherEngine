@@ -14,6 +14,8 @@ enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
     case textLimitExceeded
     case unsupportedTextCodec
     case codecOpenFailed(code: Int32)
+    /// AE#984: the whole-body fetch of a text sidecar was answered with this status.
+    case httpStatus(Int)
 
     var description: String {
         switch self {
@@ -24,6 +26,7 @@ enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
         case .textLimitExceeded: "SubtitleDecoder: text resource limit"
         case .unsupportedTextCodec: "SubtitleDecoder: unsupported text codec"
         case .codecOpenFailed(let code): "SubtitleDecoder: decoder open failed (\(FFmpegErr.text(for: code)))"
+        case .httpStatus(let status): "SubtitleDecoder: the sidecar was answered with HTTP \(status)"
         }
     }
 
@@ -35,6 +38,8 @@ enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
 struct SidecarDecodeResult {
     let cues: [SubtitleCue]
     let assHeader: String?
+    /// #921: set instead of `cues` when the caller asked for a bitmap stream's packets.
+    var bitmapSource: SidecarBitmapSource? = nil
 }
 
 /// One-shot decoder for sidecar subtitle files (.srt/.ass/.vtt/.ssa).
@@ -60,16 +65,21 @@ enum SubtitleDecoder {
     /// URLs that are containers holding several subtitle streams; nil decodes the container's first
     /// subtitle stream (the pre-#266 behaviour). An index that is out of range or names a
     /// non-subtitle stream throws `streamIndexNotSubtitle`.
+    /// `keepsBitmapPackets` (#921): a bitmap stream is read into a `SidecarBitmapSource` and not
+    /// decoded at all; the result carries no cues. Text streams decode as before either way.
     static func decodeFile(
         url: URL,
         httpHeaders: [String: String] = [:],
         preserveASSMarkup: Bool = false,
         sourceStreamIndex: Int32? = nil,
-        preparationPolicy: ExternalSubtitlePreparationPolicy? = nil
+        preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
+        keepsBitmapPackets: Bool = false,
+        formatHint: String? = nil
     ) async throws -> SidecarDecodeResult {
         let results = try await decode(
             url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
-            requested: sourceStreamIndex.map { [$0] }, preparationPolicy: preparationPolicy
+            requested: sourceStreamIndex.map { [$0] }, preparationPolicy: preparationPolicy,
+            keepsBitmapPackets: keepsBitmapPackets, formatHint: formatHint
         )
         guard let only = results.first else { throw SubtitleDecoderError.noSubtitleStream }
         return only
@@ -84,12 +94,13 @@ enum SubtitleDecoder {
         url: URL,
         httpHeaders: [String: String] = [:],
         preserveASSMarkup: Bool = false,
-        sourceStreamIndices: [Int32?]
+        sourceStreamIndices: [Int32?],
+        formatHint: String? = nil
     ) async throws -> [SidecarDecodeResult] {
         guard !sourceStreamIndices.isEmpty else { return [] }
         return try await decode(
             url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
-            requested: sourceStreamIndices
+            requested: sourceStreamIndices, formatHint: formatHint
         )
     }
 
@@ -98,8 +109,17 @@ enum SubtitleDecoder {
         url: URL,
         httpHeaders: [String: String],
         preserveASSMarkup: Bool,
-        requested: [Int32?]?, preparationPolicy: ExternalSubtitlePreparationPolicy? = nil
+        requested: [Int32?]?, preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
+        keepsBitmapPackets: Bool = false, formatHint: String? = nil
     ) async throws -> [SidecarDecodeResult] {
+        // AE#984: a text sidecar over HTTP is one whole-body GET, then a local decode.
+        if preparationPolicy == nil, SidecarTextFetch.appliesTo(url, formatHint: formatHint) {
+            let local = try await SidecarTextFetch.download(url, headers: httpHeaders, formatHint: formatHint)
+            defer { try? FileManager.default.removeItem(at: local) }
+            return try await decode(
+                url: local, httpHeaders: [:], preserveASSMarkup: preserveASSMarkup,
+                requested: requested, keepsBitmapPackets: keepsBitmapPackets)
+        }
         // Task.cancel() does NOT propagate into detached tasks (isCancelled inside always false).
         // Bridge cancellation explicitly via CancelFlag so the decode loop + AVIO reader abort promptly.
         let token = CancelFlag()
@@ -107,7 +127,8 @@ enum SubtitleDecoder {
             try await BlockingWork.detached(priority: .userInitiated) {
                 try decodeFileSync(
                     url: url, httpHeaders: httpHeaders,
-                    preserveASSMarkup: preserveASSMarkup, requested: requested, cancel: token, preparationPolicy: preparationPolicy
+                    preserveASSMarkup: preserveASSMarkup, requested: requested, cancel: token, preparationPolicy: preparationPolicy,
+                    keepsBitmapPackets: keepsBitmapPackets
                 )
             }.value
         } onCancel: {
@@ -398,7 +419,8 @@ enum SubtitleDecoder {
 
     private static func decodeFileSync(
         url: URL, httpHeaders: [String: String],
-        preserveASSMarkup: Bool, requested: [Int32?]?, cancel: CancelFlag, preparationPolicy: ExternalSubtitlePreparationPolicy?
+        preserveASSMarkup: Bool, requested: [Int32?]?, cancel: CancelFlag, preparationPolicy: ExternalSubtitlePreparationPolicy?,
+        keepsBitmapPackets: Bool = false
     ) throws -> [SidecarDecodeResult] {
         if let preparationPolicy {
             #if DEBUG
@@ -493,18 +515,26 @@ enum SubtitleDecoder {
         }
 
         var decodersByStream: [Int32: StreamDecode] = [:]
+        // #921: bitmap streams read into packets instead, never decoded here.
+        var bitmapSources: [Int32: SidecarBitmapSource] = [:]
         // Registered after the avformat_close_input defer, so LIFO runs it FIRST: the codec
         // contexts go before the format context, matching the pre-#266 defer order. Covers the
         // throwing paths below too.
         defer { decodersByStream.removeAll() }
-        for index in resolved where decodersByStream[index] == nil {
+        for index in resolved where decodersByStream[index] == nil && bitmapSources[index] == nil {
             guard let stream = fmt.pointee.streams[Int(index)] else {
                 throw SubtitleDecoderError.streamIndexNotSubtitle(index: index)
+            }
+            if keepsBitmapPackets, preparationPolicy == nil,
+               let source = SidecarBitmapSource(stream: stream) {
+                bitmapSources[index] = source
+                continue
             }
             decodersByStream[index] = try StreamDecode(
                 streamIndex: index, stream: stream, preserveASSMarkup: preserveASSMarkup, preparationPolicy: preparationPolicy)
         }
 
+        var reachedEOF = false
         while !cancel.isCancelled {
             var pktPtr: UnsafeMutablePointer<AVPacket>? = trackedPacketAlloc()
             guard let pkt = pktPtr else { break }
@@ -512,15 +542,18 @@ enum SubtitleDecoder {
             if readRet < 0 {
                 trackedPacketFree(&pktPtr)
                 if preparationPolicy != nil && readRet != FFmpegErr.eof { throw SubtitleDecoderError.openFailed(code: readRet) }
+                reachedEOF = readRet == FFmpegErr.eof
                 break
             }
 
-            if let decoder = decodersByStream[pkt.pointee.stream_index] {
+            let decoder = decodersByStream[pkt.pointee.stream_index]
+            let bitmapSource = bitmapSources[pkt.pointee.stream_index]
+            if decoder != nil || bitmapSource != nil,
+               let stream = fmt.pointee.streams[Int(pkt.pointee.stream_index)] {
                 // Audit FEA-101 / SUB-105: this loop reads libavformat directly, past Demuxer's bound.
-                if let stream = fmt.pointee.streams[Int(pkt.pointee.stream_index)] {
-                    SourceTimestampBounds.sanitize(pkt, timeBase: stream.pointee.time_base)
-                }
-                decoder.decode(packet: pkt)
+                SourceTimestampBounds.sanitize(pkt, timeBase: stream.pointee.time_base)
+                decoder?.decode(packet: pkt)
+                bitmapSource?.harvest(packet: pkt, timeBase: stream.pointee.time_base)
             }
 
             av_packet_unref(pkt)
@@ -539,8 +572,12 @@ enum SubtitleDecoder {
             if preparationPolicy != nil && decoder.decodeFailed { throw SubtitleDecoderError.openFailed(code: -1) }
         }
         if preparationPolicy != nil && cancel.isCancelled { throw CancellationError() }
+        if reachedEOF { bitmapSources.values.forEach { $0.finishReading() } }
 
-        return resolved.compactMap { decodersByStream[$0]?.result }
+        return resolved.compactMap { index in
+            decodersByStream[index]?.result
+                ?? bitmapSources[index].map { SidecarDecodeResult(cues: [], assHeader: nil, bitmapSource: $0) }
+        }
     }
 
     private static func firstSubtitleStreamIndex(in fmt: UnsafeMutablePointer<AVFormatContext>) -> Int32? {

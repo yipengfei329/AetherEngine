@@ -131,6 +131,18 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// an `av_buffer_ref` and unrefs it on disposal (dolby-vision-fel.md §5.4).
     var useCustomBlockSource: Bool = false
 
+    /// Set by `DualLayerVideoDecoder` for its base-layer decoder. The composer is designed to write the
+    /// composed pixels into that decoded buffer, and the composed output measured bit-identical with and
+    /// without the normalizer's owned copy, so the copy (a second 4K pool, about 315 MB of IOSurface in
+    /// the app) only costs memory. Frames that go out as the base layer (bypass, refused compose) gain
+    /// the same colour and aspect attachments on every frame. Every other path keeps the copy unless
+    /// VideoToolbox grants `imageBufferModifiable`.
+    var allowsInPlaceOutputMetadata: Bool = false
+
+    func outputIsModifiable(_ infoFlags: VTDecodeInfoFlags) -> Bool {
+        allowsInPlaceOutputMetadata || infoFlags.contains(.imageBufferModifiable)
+    }
+
     #if DEBUG
     /// Called after a packet has been handed to VideoToolbox (whatever the status it returned), and
     /// not for one the epoch gate or a missing session refused.
@@ -170,6 +182,20 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         set { skipLock.lock(); _onSessionLost = newValue; skipLock.unlock() }
     }
     private var _onSessionLost: (@Sendable () -> Void)?
+
+    /// A keyframe reached `decode` while the session is lost, so the owner can retry a rebuild that was
+    /// refused. That keyframe itself is dropped, not decoded: VOD recovers by seeking back, and live
+    /// with no rewind ring waits one GOP for the next keyframe. Fired on the feed thread, once per
+    /// such keyframe; the owner decides whether a retry is due.
+    var onKeyframeWhileLost: (@Sendable () -> Void)? {
+        get { skipLock.lock(); defer { skipLock.unlock() }; return _onKeyframeWhileLost }
+        set { skipLock.lock(); _onKeyframeWhileLost = newValue; skipLock.unlock() }
+    }
+    private var _onKeyframeWhileLost: (@Sendable () -> Void)?
+
+    /// True from the moment the system invalidates the session (or a rebuild is refused) until a
+    /// rebuild succeeds.
+    var isSessionLost: Bool { lock.lock(); defer { lock.unlock() }; return sessionLost }
 
     /// AE#739, all guarded by `lock`. `sessionLost` drops every packet instead of feeding a dead
     /// session; `awaitingKeyframe` drops packets after a rebuild until one the new session can start
@@ -307,9 +333,13 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         formatCodecType = configuration.codecType
         formatExtensions = configuration.extensions
         if codecpar.pointee.codec_id == AV_CODEC_ID_VP9 {
+            // Swift 6.2.3 is a proxy for the mobile declaration in stock Xcode 26.2 SDKs.
+            // Custom compiler/SDK pairings are not covered; capability queries stay outside.
+            #if os(macOS) || compiler(>=6.2.3)
             if #available(macOS 11.0, iOS 26.2, tvOS 26.2, visionOS 26.2, *) {
                 VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9)
             }
+            #endif
             guard VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9) else {
                 throw VideoDecoderError.hardwareDecoderUnavailable(codec: "VP9")
             }
@@ -452,9 +482,13 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// every frame after it with kVTVideoDecoderBadDataErr, which libavcodec never did. So the key frame
     /// gets a format description and session of its own size, after the old session has delivered
     /// what it still holds. Not an epoch change: the packets that follow belong to the same feed.
-    private func adoptVP9FrameSize(_ size: (width: Int32, height: Int32)) {
+    private func adoptVP9FrameSize(_ size: (width: Int32, height: Int32), epoch: UInt64?) {
         lock.lock()
         defer { lock.unlock() }
+        // A parked keyframe can outlive the seek that retired its feed. Refuse it before even
+        // replacing the session: rejecting its eventual decode cannot restore the references lost
+        // by that replacement. The same lock orders this check and replacement against flush().
+        if let epoch, epoch != currentEpoch { return }
         guard size.width != width || size.height != height,
               let old = session, !sessionLost, let refConBox else { return }
         var fd: CMVideoFormatDescription?
@@ -489,6 +523,12 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
 
     #if DEBUG
+    /// Marks the session lost without touching VideoToolbox, so a test can feed keyframes to a decoder that
+    /// has no session and see them reported.
+    func markSessionLostForTesting() {
+        lock.lock(); sessionLost = true; lock.unlock()
+    }
+
     /// Invalidate the live session without forgetting it, which is what the system does on an iOS
     /// screen lock: the next decode returns `kVTInvalidSessionErr`. For the aetherctl harness.
     func invalidateSessionForTesting() {
@@ -604,13 +644,15 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
            let data = packet.pointee.data, packet.pointee.size > 0,
            let size = VideoToolboxVideoFormat.vp9KeyFrameSize(
             UnsafeBufferPointer(start: data, count: Int(packet.pointee.size))) {
-            adoptVP9FrameSize(size)
+            adoptVP9FrameSize(size, epoch: epoch)
         }
         lock.lock()
         // AE#492: see `SoftwareVideoDecoder.decode`. Same rule, same lock as `flush()`.
         if let epoch, epoch != currentEpoch { lock.unlock(); return }
         guard session != nil, !sessionLost, let formatDesc = formatDescription else {
+            let lost = sessionLost
             lock.unlock()
+            if lost, (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0 { onKeyframeWhileLost?() }
             return
         }
         lock.unlock()
@@ -876,7 +918,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             : colorTransfer
         var outputBuffer = outputMetadataNormalizer.applyingOutputMetadata(
             to: imageBuffer,
-            isModifiable: infoFlags.contains(.imageBufferModifiable),
+            isModifiable: outputIsModifiable(infoFlags),
             colorPrimaries: colorPrimaries,
             transferFunction: shownTransfer,
             yCbCrMatrix: colorMatrix,
@@ -887,10 +929,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             // layer's dynamic range, while the same RPU on a copy in a pool of our own was visibly applied
             // and responded to both (DVLab ab-test2, rounds 1 and 2). So the frame goes out as that copy,
             // unless the normalizer already handed back one of its own.
-            if outputBuffer === imageBuffer, let copy = rpuFrameCopier.copy(imageBuffer) {
-                outputBuffer = copy
-            }
-            AV1DolbyVisionRPUTable.attach(AV1DolbyVisionRPU.attachEnabled ? rpu : nil, to: outputBuffer)
+            outputBuffer = AV1DolbyVisionRPUTable.attachingToOwnedOutput(
+                AV1DolbyVisionRPU.attachEnabled ? rpu : nil,
+                normalized: outputBuffer, original: imageBuffer, copyOriginal: rpuFrameCopier.copy)
         }
 
         reportDecodedFormat(outputBuffer)
@@ -944,4 +985,10 @@ protocol VideoSessionRebuilding: AnyObject {
     @discardableResult func rebuildSession() -> Bool
 }
 
-extension HardwareVideoDecoder: VideoSessionRebuilding {}
+/// A decoder that reports each keyframe fed while its session is lost, which is when a refused rebuild can
+/// be retried. Separate from `VideoSessionRebuilding` so a decoder that cannot report it still rebuilds.
+protocol VideoSessionKeyframeReporting: VideoSessionRebuilding {
+    var onKeyframeWhileLost: (@Sendable () -> Void)? { get set }
+}
+
+extension HardwareVideoDecoder: VideoSessionKeyframeReporting {}

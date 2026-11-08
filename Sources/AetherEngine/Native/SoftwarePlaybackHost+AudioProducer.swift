@@ -19,10 +19,23 @@ extension SoftwarePlaybackHost {
         }
         func pcm() throws -> (producer: any SoftwareAudioProducing, route: SoftwareAtmosRoute) {
             let decoder = AudioDecoder()
+            decoder.shaping = audioShaping
             try decoder.open(stream: stream)
             return (decoder, .pcm)
         }
-        guard objectAudioRendering != .off, !isLive else { return try pcm() }
+        if audioShaping.isActive {
+            EngineLog.emit("[SWHost] audio: AE#923 shaping (\(audioShaping.summary)) keeps the track on the PCM decode",
+                           category: .swPlayback)
+            return try pcm()
+        }
+        guard objectAudioRendering != .off, !isLive else {
+            if let note = Self.eac3PCMRouteNote(
+                codecID: par.pointee.codec_id, rendering: objectAudioRendering, isLive: isLive,
+                dualLayerRoute: decodesDualLayer) {
+                EngineLog.emit(note, category: .swPlayback)
+            }
+            return try pcm()
+        }
 
         // The look at the stream and the DTS:X verdict run off the main actor, and a stop() can land
         // while they do: it closes the demuxer, which frees the streams `stream` and `par` point into.
@@ -84,14 +97,45 @@ extension SoftwarePlaybackHost {
                                category: .swPlayback)
                 return try pcm()
             }
-        case .apac(let layout):
+        case .decodedEAC3JOC(let layout):
+            guard let joc else { return try pcm() }
+            do {
+                // Opened at once: on tvOS the system decoder reads the objects without the registration
+                // (measured), which still runs so a later session or a route change finds it done.
+                AtmosDecoderPrimer.shared.begin()
+                let producer = try SoftwareEAC3AtmosDecoder(stream: stream, entry: joc, layout: layout)
+                EngineLog.emit("[SWHost] audio: E-AC-3 JOC decoded by the system into \(layout.rawValue) as PCM for the renderer",
+                               category: .swPlayback)
+                return (producer, route)
+            } catch {
+                // The PCM decode, not the compressed hand-off: on this platform that plays silent.
+                EngineLog.emit("[SWHost] audio: E-AC-3 JOC system decode unavailable (\(error)); PCM decode",
+                               category: .swPlayback)
+                return try pcm()
+            }
+        case .apac(let layout), .pcmBed(let layout):
             guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return try pcm() }
-            let producer = await makeAPACProducer(demuxer: dem, stream: stream, streamIndex: streamIndex, layout: layout)
+            let format: SpatialBedFormat = route == .pcmBed(layout) ? .lpcm : .apac
+            let producer = await makeAPACProducer(
+                demuxer: dem, stream: stream, streamIndex: streamIndex, layout: layout, format: format)
             if let settled = try Self.settleAPACProducer(producer, stopped: stopRequested || Task.isCancelled) {
                 return (settled, route)
             }
             return try pcm()
         }
+    }
+
+    /// The route line for an E-AC-3 track on the Profile 7 FEL dual-layer route when nothing asks for the
+    /// objects: the track is decoded to PCM, so a JOC (Atmos) track plays as its channel bed. nil for any
+    /// other codec or route, and when the object path ran (it logs its own verdict). `makeAudioProducer`
+    /// runs once per session, which makes this one line per session.
+    nonisolated static func eac3PCMRouteNote(
+        codecID: AVCodecID, rendering: ObjectAudioRendering, isLive: Bool, dualLayerRoute: Bool
+    ) -> String? {
+        guard dualLayerRoute, codecID == AV_CODEC_ID_EAC3, rendering == .off || isLive else { return nil }
+        let why = isLive ? "live source" : "objectAudioRendering off"
+        return "[SWHost] audio: E-AC-3 on the dual-layer route is decoded to PCM (\(why)); "
+            + "a JOC (Atmos) track plays as its channel bed, without the objects"
     }
 
     /// What the APAC route does with `makeAPACProducer`'s answer. A stop() that landed during the
@@ -145,7 +189,7 @@ extension SoftwarePlaybackHost {
     @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
     private func makeAPACProducer(
         demuxer dem: Demuxer, stream: UnsafeMutablePointer<AVStream>, streamIndex: Int32,
-        layout: SpatialSpeakerLayout
+        layout: SpatialSpeakerLayout, format: SpatialBedFormat
     ) async -> (any SoftwareAudioProducing)? {
         // `nil` after a stop() is as good as any other nil: the caller checks the stop before it
         // touches the stream again. Nothing here reads `stream` once the verdict has been awaited
@@ -184,12 +228,14 @@ extension SoftwarePlaybackHost {
                 return nil
                 #endif
             }
-            let bridge = try SpatialAudioBridge(srcTimeBase: stream.pointee.time_base, layout: layout, decoder: decoder)
+            let bridge = try SpatialAudioBridge(
+                srcTimeBase: stream.pointee.time_base, layout: layout, decoder: decoder, format: format)
             bridge.onDecoderProducedNothing = { stats in
                 EngineLog.emit("[SWHost] ERROR: \(source.name) object decoder produced nothing: \(stats.summary)",
                                category: .swPlayback)
             }
-            EngineLog.emit("[SWHost] audio: \(source.name) rendered into \(layout.rawValue) as APAC for the renderer",
+            EngineLog.emit("[SWHost] audio: \(source.name) rendered into \(layout.rawValue) as "
+                           + "\(format == .lpcm ? "PCM" : "APAC") for the renderer",
                            category: .swPlayback)
             return SoftwareAPACProducer(bridge: bridge, stream: stream)
         } catch {
@@ -203,7 +249,7 @@ extension SoftwarePlaybackHost {
     @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
     private func makeAPACProducer(
         demuxer dem: Demuxer, stream: UnsafeMutablePointer<AVStream>, streamIndex: Int32,
-        layout: SpatialSpeakerLayout
+        layout: SpatialSpeakerLayout, format: SpatialBedFormat
     ) async -> (any SoftwareAudioProducing)? {
         EngineLog.emit("[SWHost] audio: built without an object-audio trait; PCM decode", category: .swPlayback)
         return nil
