@@ -137,7 +137,8 @@ final class EmbeddedSubtitleDecoder {
     /// and fire the first PGS cue immediately (confirmed with Harry Potter, first cue at source PTS=19.186 s).
     func decode(
         packet: UnsafeMutablePointer<AVPacket>,
-        streamTimeBase: AVRational
+        streamTimeBase: AVRational,
+        storedBitmapPacketPTS: Double? = nil
     ) -> SubtitleEvent? {
         guard let ctx = codecContext else { return nil }
 
@@ -190,7 +191,13 @@ final class EmbeddedSubtitleDecoder {
         let isTeletext = ctx.pointee.codec_id == AV_CODEC_ID_DVB_TELETEXT
         let tbSec = Double(streamTimeBase.num) / Double(streamTimeBase.den)
         let rawPTS = packet.pointee.pts
-        let pktPTS = (rawPTS == Int64.min) ? 0 : Double(rawPTS) * tbSec
+        var pktPTS = (rawPTS == Int64.min) ? 0 : Double(rawPTS) * tbSec
+        // Aligning a bitmap to the next stored packet uses the original PTS. Preserve that same
+        // precision in the cue and clear so neither can round into a neighboring packet.
+        if rawPTS != Int64.min, Self.isBitmapCodec(ctx.pointee.codec_id),
+           let storedBitmapPacketPTS {
+            pktPTS = storedBitmapPacketPTS
+        }
         let startOffset = Double(sub.start_display_time) / 1000.0
         var endOffset: Double
         if sub.end_display_time > 0 {

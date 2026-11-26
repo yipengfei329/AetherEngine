@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import CoreGraphics
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #362: a display set closed by its successor instead of by its own clear packet.
@@ -48,6 +49,31 @@ struct Issue362AuthoredClearTests {
     }
 
     // MARK: - The reported case
+
+    @Test("bitmap starts retain their original packet time and can close within a millisecond",
+          arguments: [6.976167, 6.976833])
+    func bitmapStartsBeforeTheirActualClear(start: Double) throws {
+        let clear = start + 0.00025
+        var parameters = avcodec_parameters_alloc()
+        defer { avcodec_parameters_free(&parameters) }
+        let par = try #require(parameters)
+        par.pointee.codec_type = AVMEDIA_TYPE_SUBTITLE
+        par.pointee.codec_id = AV_CODEC_ID_DVB_SUBTITLE
+        let decoder = try #require(EmbeddedSubtitleDecoder(
+            codecpar: par, sourceVideoWidth: 1920, sourceVideoHeight: 1080))
+        let packet = StoredSubtitlePacket(ptsSeconds: start, durationSeconds: 0, flags: 0,
+                                          payload: Data(Issue971DVBCanvasTests.displaySet(dds: nil)))
+        let event = try #require(AetherEngine.decodeStoredSubtitlePacket(packet, with: decoder))
+        var cues = event.cues
+        #expect(try #require(cues.first).startTime == start)
+        let store = SubtitlePacketStore()
+        store.append(streamIndex: 3, ptsSeconds: start, durationSeconds: 0, payload: packet.payload)
+        store.append(streamIndex: 3, ptsSeconds: clear, durationSeconds: 0, payload: Data([0x80]))
+        #expect(AetherEngine.alignCueEnds(&cues, toNextPacket: {
+            store.firstPTS(streamIndex: 3, after: $0)
+        }))
+        #expect(try #require(cues.first).endTime == clear)
+    }
 
     @Test("the open set is closed at its own clear packet, not at its successor")
     func openSetTakesTheAuthoredClear() {

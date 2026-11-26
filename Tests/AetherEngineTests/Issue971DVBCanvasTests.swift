@@ -20,7 +20,7 @@ struct Issue971DVBCanvasTests {
 
     private static func be16(_ v: Int) -> [UInt8] { [UInt8(v >> 8), UInt8(v & 0xFF)] }
 
-    private static func displaySet(dds: (width: Int, height: Int)?) -> [UInt8] {
+    static func displaySet(dds: (width: Int, height: Int)?) -> [UInt8] {
         var bytes: [UInt8] = []
         if let dds {
             bytes += segment(0x14, [0x00] + be16(dds.width - 1) + be16(dds.height - 1))

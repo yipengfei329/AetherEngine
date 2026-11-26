@@ -21,6 +21,8 @@ the public-API contract.
 
 ### Fixed
 
+- **Bitmap subtitles retain their original packet timestamps (AE#1001).** A stored composition could close at its own packet when its start rounded down to a millisecond. Its authored clear now closes it, including clears closer than one millisecond.
+
 - **Stopping after a long watch no longer holds the main thread (AE#998).** The engine's `currentItem` observer
   asked KVO for the new value, and the Swift overlay decodes that value through a runtime cast before the
   closure runs. Inside the `replaceCurrentItem` of a stop after a few minutes of playback, that cast missed the

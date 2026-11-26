@@ -207,7 +207,8 @@ struct SoftwarePacketDiskFIFOTests {
         let stale = try makeOrphan(testRoot, modified: old)
         let noMarker = try makeOrphan(testRoot, modified: old, marker: false)
         let fresh = try makeOrphan(testRoot, modified: now)
-        let almostOld = try makeOrphan(testRoot, modified: now.addingTimeInterval(-86_399.5))
+        let justUnderStaleAge = -(SoftwarePacketDiskFIFO.staleAgeSeconds - 0.5)
+        let almostOld = try makeOrphan(testRoot, modified: now.addingTimeInterval(justUnderStaleAge))
         let current = try makeOrphan(testRoot, modified: old)
         let active = try SoftwarePacketDiskFIFO(parentDirectory: testRoot, now: now)
         defer { try? active.close() }

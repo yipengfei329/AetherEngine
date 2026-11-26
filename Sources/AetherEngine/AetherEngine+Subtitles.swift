@@ -1105,7 +1105,8 @@ extension AetherEngine {
         if let settings = entry.webvttSettings {
             WebVTTCueSettings.attach(settings: settings, to: pkt)
         }
-        return decoder.decode(packet: pkt, streamTimeBase: AVRational(num: 1, den: 1000))
+        return decoder.decode(packet: pkt, streamTimeBase: AVRational(num: 1, den: 1000),
+                              storedBitmapPacketPTS: entry.ptsSeconds)
     }
 
     /// #271: the channel's retained array, bound once per drain tick. Reading it here and writing it
